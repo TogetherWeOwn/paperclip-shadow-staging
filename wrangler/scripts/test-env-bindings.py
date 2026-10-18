@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Offline regressions for optional alert bindings. No Worker API calls."""
+import importlib.util
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location(
+    "check_env_bindings", Path(__file__).with_name("check-env-bindings.py")
+)
+checker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(checker)
+# Optional operator tuning in the real config must not create duplicate keys
+# in our synthetic fixtures or change the omitted-binding test's meaning.
+def fixture_base(content):
+    return re.sub(
+        r"^[ \t]*(?:UNREADY_ALERT_FAILURES|OPS_ALERT_WEBHOOK_URL)[ \t]*=.*(?:\n|$)",
+        "",
+        content,
+        flags=re.MULTILINE,
+    )
+
+
+BASE = fixture_base(Path(__file__).parents[1].joinpath("wrangler.toml").read_text())
+
+
+class AlertBindingTests(unittest.TestCase):
+    def check_config(self, content):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wrangler.toml"
+            path.write_text(content)
+            return checker.check(path)
+
+    def test_missing_optional_secret_is_log_only(self):
+        self.assertEqual(self.check_config(BASE), [])
+
+    def test_optional_fixture_keys_can_be_indented(self):
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            for indent in ["", "  ", "\t"]:
+                with self.subTest(section=section, indent=repr(indent)):
+                    config = BASE.replace(
+                        f"[{section}]",
+                        f'[{section}]\n{indent}UNREADY_ALERT_FAILURES = "5" # operator tuning',
+                    )
+                    self.assertEqual(self.check_config(config), [], "indented tuning is valid TOML")
+                    self.assertEqual(fixture_base(config), BASE)
+                    config = config.replace(
+                        f"[{section}]",
+                        f'[{section}]\n{indent}OPS_ALERT_WEBHOOK_URL = "synthetic-secret"',
+                    )
+                    normalized = fixture_base(config)
+                    self.assertEqual(normalized, BASE)
+                    replacement = normalized.replace(
+                        f"[{section}]", f'[{section}]\nUNREADY_ALERT_FAILURES = "3"'
+                    )
+                    self.assertEqual(self.check_config(replacement), [], "fixtures must not duplicate tuning keys")
+
+    def test_plaintext_webhook_is_rejected_without_echoing_value(self):
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(
+                    f"[{section}]", f'[{section}]\nOPS_ALERT_WEBHOOK_URL = "synthetic-secret"'
+                )
+                errors = self.check_config(config)
+                self.assertEqual(len(errors), 1)
+                self.assertIn("must be an optional Worker secret", errors[0])
+                self.assertNotIn("synthetic-secret", errors[0])
+
+    def test_threshold_can_be_env_specific_or_omitted(self):
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nUNREADY_ALERT_FAILURES = "5"')
+                self.assertEqual(self.check_config(config), [])
+
+    def test_invalid_threshold_is_rejected(self):
+        for value in ['"0"', '"-1"', '"1.5"', '" 5 "', '"1e1"', '""', '"9007199254740992"', '"٣"', "3"]:
+            with self.subTest(value=value):
+                config = BASE.replace("[env.staging.vars]", f"[env.staging.vars]\nUNREADY_ALERT_FAILURES = {value}")
+                self.assertTrue(any("positive safe-integer string" in e for e in self.check_config(config)))
+
+    def test_optional_handling_does_not_weaken_required_bindings(self):
+        config = BASE.replace('KEEPALIVE_SECONDS = "60"\nTWO_GUILD_NAME', "TWO_GUILD_NAME", 1)
+        self.assertTrue(any("missing vars ['KEEPALIVE_SECONDS']" in e for e in self.check_config(config)))
+
+    def test_ingress_is_staging_only_and_deployed_dark(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('INTERNAL_ACTIONS_INGRESS = "1"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nINTERNAL_ACTIONS_INGRESS = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("INTERNAL_ACTIONS_INGRESS is staging-only" in e for e in errors), errors)
+        # Absent from staging is also fine: the route is simply dark.
+        self.assertEqual(
+            self.check_config(BASE.replace('INTERNAL_ACTIONS_INGRESS = "1"\n', "")), []
+        )
+
+    def test_ingress_value_must_be_exactly_one(self):
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('INTERNAL_ACTIONS_INGRESS = "1"', f"INTERNAL_ACTIONS_INGRESS = {value}")
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_boot_publish_is_staging_only(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('TWO_COMMANDS_PUBLISH_ON_BOOT = "1"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_COMMANDS_PUBLISH_ON_BOOT = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("TWO_COMMANDS_PUBLISH_ON_BOOT is staging-only" in e for e in errors), errors)
+        # Absent from staging is also fine: boot publication is simply off.
+        self.assertEqual(
+            self.check_config(BASE.replace('TWO_COMMANDS_PUBLISH_ON_BOOT = "1"\n', "")), []
+        )
+
+    def test_boot_publish_value_must_be_exactly_one(self):
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace(
+                    'TWO_COMMANDS_PUBLISH_ON_BOOT = "1"', f"TWO_COMMANDS_PUBLISH_ON_BOOT = {value}"
+                )
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_voice_gate_is_staging_only(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('TWO_VOICE = "1"', staging)
+        self.assertEqual(self.check_config(BASE), [])
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_VOICE = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("TWO_VOICE is staging-only" in e for e in errors), errors)
+        # Absent from staging is also fine: voice is simply off (rollback).
+        self.assertEqual(self.check_config(BASE.replace('TWO_VOICE = "1"\n', "")), [])
+
+    def test_voice_gate_value_must_be_exactly_one(self):
+        for value in ['"0"', '"true"', '""', '"1 "', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('TWO_VOICE = "1"', f"TWO_VOICE = {value}")
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_voice_presence_is_staging_only(self):
+        staging = BASE.split("[env.staging.vars]", 1)[1].split("\n[", 1)[0]
+        self.assertIn('TWO_VOICE_PRESENCE = "1"', staging)
+        for section in ["vars", "env.production.vars"]:
+            with self.subTest(section=section):
+                config = BASE.replace(f"[{section}]", f'[{section}]\nTWO_VOICE_PRESENCE = "1"', 1)
+                errors = self.check_config(config)
+                self.assertTrue(any("TWO_VOICE_PRESENCE is staging-only" in e for e in errors), errors)
+        self.assertEqual(self.check_config(BASE.replace('TWO_VOICE_PRESENCE = "1"\n', "")), [])
+        for value in ['"0"', '"true"', '""', "1"]:
+            with self.subTest(value=value):
+                config = BASE.replace('TWO_VOICE_PRESENCE = "1"', f"TWO_VOICE_PRESENCE = {value}")
+                self.assertTrue(any('must be exactly "1"' in e for e in self.check_config(config)))
+
+    def test_receiver_config_is_never_a_toml_var(self):
+        for section in ["vars", "env.staging.vars", "env.production.vars"]:
+            for key in ["TWO_INTERNAL_KEYS", "TWO_INTERNAL_ACTIONS", "TWO_INTERNAL_BIND", "TWO_INTERNAL_CONTAINER"]:
+                with self.subTest(section=section, key=key):
+                    config = BASE.replace(f"[{section}]", f'[{section}]\n{key} = "synthetic-secret"', 1)
+                    errors = self.check_config(config)
+                    self.assertTrue(any(f"{key} is an Operator-set Worker secret" in e for e in errors), errors)
+                    self.assertFalse(any("synthetic-secret" in e for e in errors))
+
+
+def drop_env(content, env):
+    """Remove every [env.<env>.*] section header and its body lines."""
+    out = []
+    skip = False
+    for line in content.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("["):
+            skip = stripped == f"[env.{env}]\n" or stripped.startswith(
+                (f"[env.{env}.", f"[[env.{env}.")
+            )
+            if skip:
+                continue
+        if skip:
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def top_level_prefix(content):
+    """Lines before the first [env.*] section (top-level config only)."""
+    out = []
+    for line in content.splitlines(keepends=True):
+        if line.lstrip().startswith(("[env.", "[[env.")):
+            break
+        out.append(line)
+    return "".join(out)
+
+
+class RequiredEnvironmentTests(unittest.TestCase):
+    def check_config(self, content):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wrangler.toml"
+            path.write_text(content)
+            return checker.check(path)
+
+    def run_cli(self, path):
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("check-env-bindings.py")), str(path)],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_missing_staging_is_rejected(self):
+        errors = self.check_config(drop_env(BASE, "staging"))
+        required = [e for e in errors if "missing required environment(s)" in e]
+        self.assertEqual(len(required), 1)
+        self.assertIn("['staging']", required[0])
+
+    def test_missing_production_is_rejected(self):
+        errors = self.check_config(drop_env(BASE, "production"))
+        self.assertTrue(any("missing required environment(s)" in e for e in errors), errors)
+        required = [e for e in errors if "missing required environment(s)" in e]
+        self.assertEqual(len(required), 1)
+        self.assertIn("['production']", required[0])
+
+    def test_missing_both_envs_is_rejected(self):
+        errors = self.check_config(drop_env(drop_env(BASE, "staging"), "production"))
+        required = [e for e in errors if "missing required environment(s)" in e]
+        self.assertEqual(len(required), 1)
+        self.assertIn("staging", required[0])
+        self.assertIn("production", required[0])
+
+    def test_additional_env_is_still_checked(self):
+        config = BASE + '\n[env.preview.vars]\nTWO_GUILD_NAME = "Preview"\n'
+        errors = self.check_config(config)
+        self.assertTrue(any("[env.preview]" in e for e in errors), errors)
+        self.assertFalse(any("missing required environment(s)" in e for e in errors), errors)
+
+    def test_malformed_toml_is_controlled(self):
+        marker = "SYNTHETIC_MALFORMED_MARKER_XYZ"
+        errors = self.check_config(f"NOT VALID TOML [[[\n{marker} = \"unclosed\n")
+        self.assertEqual(len(errors), 1)
+        self.assertIn("invalid Wrangler config", errors[0])
+        self.assertNotIn(marker, errors[0])
+
+    def test_malformed_toml_cli_has_no_traceback(self):
+        marker = "SYNTHETIC_MALFORMED_MARKER_XYZ"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wrangler.toml"
+            path.write_text(f"NOT VALID TOML [[[\n{marker} = \"unclosed\n")
+            proc = self.run_cli(path)
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("Traceback", combined)
+        self.assertNotIn(marker, combined)
+
+    def test_missing_file_is_controlled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "does-not-exist.toml"
+            errors = checker.check(missing)
+            proc = self.run_cli(missing)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("unreadable Wrangler config", errors[0])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("Traceback", proc.stdout + proc.stderr)
+
+    def test_duplicate_table_never_echoes_names(self):
+        # tomllib quotes the offending table name ("Cannot declare ..."),
+        # so this pins that the diagnostic discards the parser error.
+        marker = "SYNTHETIC_DUP_MARKER_XYZ"
+        errors = self.check_config(f"[{marker}]\n[{marker}]\n")
+        self.assertEqual(errors, [checker.INVALID_TOML_ERROR])
+
+    def test_non_table_env_is_controlled(self):
+        config = 'env = "not-a-table"\n' + top_level_prefix(BASE)
+        errors = self.check_config(config)
+        self.assertEqual(errors, [checker.INVALID_TOML_ERROR])
+
+    def test_wrong_shape_tables_are_controlled(self):
+        config = top_level_prefix(BASE) + "[env]\nstaging = 1\nproduction = 2\n"
+        errors = self.check_config(config)
+        self.assertEqual(errors, [checker.INVALID_TOML_ERROR])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,80 @@
+//! Twilight adapter seam for two-bot-next (ADR 0001).
+//!
+//! Converts twilight gateway dispatches into framework-free
+//! [`two_bot_core::CoreEvent`]s. The bot crate owns the shard and the cache;
+//! this crate owns the *translation*, so S3+ handler logic stays testable
+//! without a gateway connection.
+
+pub mod adapter;
+pub mod audit_mirror;
+#[cfg(feature = "db")]
+mod automation_admission;
+pub mod automod;
+pub mod automod_activation;
+pub mod channel_access;
+#[cfg(feature = "db")]
+pub mod channel_moderation;
+pub mod command_identity;
+pub mod command_registry;
+#[cfg(feature = "db")]
+pub mod custom_commands;
+pub mod executor;
+mod executor_metrics;
+
+#[cfg(feature = "db")]
+pub use channel_moderation::{
+    register_channel_handlers, ChannelModerationRuntime, ChannelReply, ChannelResponseError,
+    ChannelRuntimeError,
+};
+pub mod intents;
+pub mod interactions;
+pub mod internal_actions;
+#[cfg(feature = "db")]
+pub mod internal_channel_moderation;
+pub mod internal_events;
+#[cfg(feature = "db")]
+pub mod internal_member_moderation;
+#[cfg(feature = "db")]
+pub mod leveling_runtime;
+#[cfg(feature = "db")]
+pub mod lfg_interactions;
+pub mod member_moderation;
+mod message_safety;
+pub mod onboarding_config;
+pub mod onboarding_messages;
+pub mod onboarding_permissions;
+pub mod pipeline;
+pub mod ratelimit_guard;
+#[cfg(feature = "db")]
+pub mod rsvp;
+#[cfg(any(test, feature = "test-support"))]
+pub mod staging_slash_smoke;
+#[cfg(test)]
+mod test_clock;
+pub mod voice_rooms;
+
+#[cfg(feature = "db")]
+pub use leveling_runtime::{
+    CommunityFactsError, DeferredCommunityFacts, LevelingRuntime, OrderedLevelingPipeline,
+    RulesAcceptedWrite,
+};
+
+pub use adapter::event_to_core;
+pub use executor::{
+    is_definitive_rejection, lockdown_masks, pace_delay_ms, paced_step, throw_for_status,
+    timeout_until_iso, unlock_masks, ActionExecutor, ChannelCall, ChannelCallOutcome, DiscordCall,
+    DiscordError, EveryoneOverwrite, PacedStep, RawResponse, KICK_INTERVAL_MS,
+    MAX_AUDIT_REASON_CHARS, MAX_MESSAGE_CHARS, MODERATION_TIMEOUT_MS, PACE_INTERVAL_MS,
+};
+pub use intents::{cache_resource_types, gateway_intents, needs_message_content};
+pub use interactions::{
+    command_to_twilight, deferred_response, dispatch_interaction, help_response, publish_commands,
+    refusal_response, response_for_slash, route_interaction, text_response, DispatchOptions,
+    InteractionReplyTransport, RoutedInteraction,
+};
+pub use internal_events::{event_status_name, scheduled_event_body, EventActionError, EventCall};
+pub use pipeline::{
+    build_cache, AuditEntryObserver, AuditLogObservation, ChannelClassifier, InviteSource,
+    JoinObservation, JoinObserver, MemPipeline, MessageEligibility, NoClassification, NoInvites,
+    Pipeline, PipelineSnapshots, ScriptedInvites,
+};

@@ -1,0 +1,1057 @@
+//! Read-only Discord checks; live requests use the shared admission database.
+//! This path never starts the gateway or changes Discord permissions.
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+};
+
+use serde::Serialize;
+use twilight_gateway::Intents;
+use twilight_http::{
+    request::{Request, TryIntoRequest},
+    Client,
+};
+use twilight_model::{
+    channel::{Channel, ChannelType},
+    gateway::connection_info::BotConnectionInfo,
+    guild::{invite::Invite, Member, Permissions, Role},
+    id::Id,
+    oauth::{Application, ApplicationFlags},
+    user::CurrentUser,
+};
+use two_bot_core::onboarding::{
+    game_picker_allowed, level_role_writes_allowed, OnboardingGates, GAME_PICKS, PLATFORM_PICKS,
+    TWO_GUILD_ID,
+};
+use two_bot_core::self_roles::parse_self_role_panels;
+use two_bot_core::send_admission::PgSendAdmission;
+use two_bot_discord::channel_access::{guild_permissions, resolve_channel_access};
+use two_bot_discord::executor::HyperTransport;
+
+pub const USAGE: &str = "\
+  two-bot preflight [--json] [--level-role-ids CSV]
+      Read-only Discord REST credential, intent, role hierarchy and configured
+      channel checks. No gateway or Discord permission changes. Live requests
+      require the runtime TWO_DATABASE_URL admission authority.
+      Env: DISCORD_TOKEN, TWO_DATABASE_URL, GUILD_ID, feature/channel configuration.
+      --level-role-ids: exported level_role_rewards role IDs (empty CSV means
+      no rewards). Required when onboarding permits level-role writes.
+      Exit 0: PASS/WARN only; 1: FAIL; 2: invalid CLI/configuration.
+      See docs/preflight.md for coverage and interpretation.
+";
+
+// A cutover spends at least one session start on the forced IDENTIFY, plus
+// more on reconnect retries if the first connect fails. Discord's
+// session-start budget is a hard daily limit, so preflight fails closed with
+// margin above a single start and warns earlier at 10% of Discord's usual
+// 1000-start daily budget.
+const SESSION_START_FAIL_FLOOR: u32 = 10;
+const SESSION_START_WARN_THRESHOLD: u32 = 100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+enum Status {
+    Pass,
+    Warn,
+    Fail,
+}
+
+#[derive(Serialize)]
+struct Check {
+    status: Status,
+    check: String,
+    detail: String,
+}
+
+impl Check {
+    fn fail(check: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            status: Status::Fail,
+            check: check.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Default, Serialize)]
+struct Report {
+    checks: Vec<Check>,
+}
+
+impl Report {
+    fn add(&mut self, status: Status, check: impl Into<String>, detail: impl Into<String>) {
+        self.checks.push(Check {
+            status,
+            check: check.into(),
+            detail: detail.into(),
+        });
+    }
+
+    fn require(&mut self, ok: bool, check: impl Into<String>, detail: impl Into<String>) {
+        self.add(if ok { Status::Pass } else { Status::Fail }, check, detail);
+    }
+
+    // CLI report output only; checks themselves do not write stdout.
+    #[allow(clippy::print_stdout)]
+    fn render(&self, json: bool, code: i32) {
+        let failures = self
+            .checks
+            .iter()
+            .filter(|check| check.status == Status::Fail)
+            .count();
+        let warnings = self
+            .checks
+            .iter()
+            .filter(|check| check.status == Status::Warn)
+            .count();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1, "ready": code == 0, "exit_code": code,
+                    "failures": failures, "warnings": warnings, "checks": self.checks
+                })
+            );
+        } else {
+            println!("TWO bot preflight\nSTATUS  CHECK                           DETAIL");
+            for check in &self.checks {
+                let status = match check.status {
+                    Status::Pass => "PASS",
+                    Status::Warn => "WARN",
+                    Status::Fail => "FAIL",
+                };
+                // Never echo untrusted REST names or configuration values to the terminal.
+                println!("{status:<6}  {:<30}  {}", check.check, check.detail);
+            }
+            println!(
+                "\n{}  {failures} fail, {warnings} warn",
+                if code == 0 {
+                    "Ready for checked configuration."
+                } else {
+                    "NOT ready."
+                }
+            );
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ChannelTarget {
+    post: bool,
+    moderate: bool,
+    // View-only references can be text, forum, category or voice destinations.
+    text_only: bool,
+    // Ticket category destinations must be GuildCategory channels.
+    category: bool,
+}
+
+#[derive(Debug)]
+struct Targets {
+    guild_id: u64,
+    channels: BTreeMap<u64, ChannelTarget>,
+    roles: BTreeMap<u64, &'static str>,
+    level_roles_known: bool,
+    role_writes: bool,
+    // Any ticket key present means tickets are intended: a partial triple
+    // must fail closed rather than silently run with tickets disabled.
+    ticket_complete: bool,
+}
+
+// Strict self-role catalogue validation lives in
+// `two_bot_core::self_roles::parse_self_role_panels` (Discord bounds: 20
+// reactions, 100-unit custom ids, 80-unit button labels). Preflight reuses it
+// so a catalogue the bot would refuse at boot fails here instead of passing
+// with only channel/role targets collected.
+
+fn snowflake(raw: &str) -> Result<u64, &'static str> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("expected a nonzero Discord snowflake");
+    }
+    raw.parse::<u64>()
+        .ok()
+        .filter(|id| *id != 0)
+        .ok_or("expected a nonzero Discord snowflake")
+}
+
+fn ids(raw: &str) -> Result<Vec<u64>, &'static str> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(|value| snowflake(value.trim()))
+        .collect()
+}
+
+fn env(key: &str) -> String {
+    std::env::var(key).unwrap_or_default()
+}
+
+impl Targets {
+    fn from_env(level_ids: Option<&str>) -> Result<Self, &'static str> {
+        Self::from_map(&std::env::vars().collect(), level_ids)
+    }
+
+    fn from_map(
+        vars: &HashMap<String, String>,
+        level_ids: Option<&str>,
+    ) -> Result<Self, &'static str> {
+        let env = |key: &str| vars.get(key).cloned().unwrap_or_default();
+        let guild = env("GUILD_ID");
+        let guild = if guild.is_empty() {
+            env("DISCORD_GUILD_ID")
+        } else {
+            guild
+        };
+        let guild_id =
+            snowflake(&guild).map_err(|_| "GUILD_ID must be a nonzero Discord snowflake")?;
+        let gates = OnboardingGates::from_map(vars).map_err(|_| "invalid TWO_ONBOARDING_MODE")?;
+        let role_writes = level_role_writes_allowed(gates.mode) && !gates.dry_run;
+        let ticket_keys = [
+            "DISCORD_TICKET_CATEGORY_ID",
+            "DISCORD_TICKET_STAFF_ROLE_ID",
+            "DISCORD_TICKET_PANEL_CHANNEL_ID",
+        ];
+        let present = ticket_keys
+            .iter()
+            .filter(|key| !env(key).trim().is_empty())
+            .count();
+        // Any ticket key set means tickets are intended. Zero keys is
+        // tickets-disabled (pass); all three is the wired triple (checked
+        // below); one or two is a partial triple that must fail closed.
+        let ticket_complete = present == 0 || present == ticket_keys.len();
+        let mut targets = Self {
+            guild_id,
+            channels: BTreeMap::new(),
+            roles: BTreeMap::new(),
+            level_roles_known: !role_writes || level_ids.is_some(),
+            role_writes,
+            ticket_complete,
+        };
+        if let Some(raw) = level_ids {
+            let rewards = ids(raw).map_err(|_| "invalid --level-role-ids CSV")?;
+            if role_writes {
+                for id in rewards {
+                    targets.roles.insert(id, "level reward");
+                }
+            }
+        }
+
+        // All named channel IDs in the settings catalogue; exemption/protection
+        // lists are still checked for existence and View, but not for posting.
+        for key in [
+            "DISCORD_ANCHOR_WELCOME_CHANNEL_ID",
+            "DISCORD_AUDIT_LOG_CHANNEL_ID",
+            "DISCORD_GOODBYE_CHANNEL_IDS",
+            "DISCORD_LANDING_CHANNEL_IDS",
+            "DISCORD_MODERATION_LOG_CHANNEL_ID",
+            "DISCORD_SESSION_LOOKING_TO_PLAY_CHANNEL_ID",
+            "DISCORD_STAFF_ALERT_CHANNEL_ID",
+            "DISCORD_TICKET_PANEL_CHANNEL_ID",
+            "DISCORD_VOICE_LOG_CHANNEL_ID",
+            "TWO_TEMP_VOICE_PANEL_CHANNEL_ID",
+        ] {
+            for id in ids(&env(key)).map_err(|_| "invalid configured posting channel ID")? {
+                targets.channel(id, true, true);
+            }
+        }
+        for key in [
+            "DISCORD_SESSION_LOBBY_VOICE_CHANNEL_ID",
+            "TWO_TEMP_VOICE_GENERATOR_CHANNEL_ID",
+            "TWO_TEMP_VOICE_CATEGORY_ID",
+            "TWO_TEMP_VOICE_PROTECTED_CHANNEL_IDS",
+            "TWO_AUTOMOD_EXEMPT_CHANNEL_IDS",
+            "TWO_COMMUNITY_HUMAN_CHANNEL_IDS",
+            "TWO_COMMUNITY_WELCOME_CHANNEL_IDS",
+        ] {
+            for id in ids(&env(key)).map_err(|_| "invalid configured channel reference")? {
+                targets.channel(id, false, false);
+            }
+        }
+        // Ticket category destinations must be GuildCategory channels. They are
+        // tracked separately so a text/voice channel in this slot fails closed
+        // instead of passing as a generic view-only reference.
+        for id in ids(&env("DISCORD_TICKET_CATEGORY_ID"))
+            .map_err(|_| "invalid configured channel reference")?
+        {
+            targets.ticket_category(id);
+        }
+        // Ticket staff is a hierarchy target, not a channel. A missing,
+        // deleted, managed, @everyone, or above-the-bot role must fail here,
+        // not at the first staff claim at runtime. Reuses the same
+        // exist/unmanaged/below-bot gate as every other role target;
+        // Administrator never bypasses hierarchy.
+        let staff_raw = env("DISCORD_TICKET_STAFF_ROLE_ID");
+        if !staff_raw.trim().is_empty() {
+            let staff_id =
+                snowflake(staff_raw.trim()).map_err(|_| "invalid configured staff role ID")?;
+            targets.roles.insert(staff_id, "ticket staff");
+        }
+        let raw = env("TWO_SELF_ROLE_PANELS");
+        if !raw.trim().is_empty() {
+            let panels = parse_self_role_panels(&raw)
+                .map_err(|_| "invalid TWO_SELF_ROLE_PANELS catalogue")?;
+            for panel in panels {
+                targets.channel(
+                    snowflake(&panel.channel_id)
+                        .map_err(|_| "invalid TWO_SELF_ROLE_PANELS catalogue")?,
+                    true,
+                    true,
+                );
+                for option in panel.options {
+                    targets.roles.insert(
+                        snowflake(&option.role_id)
+                            .map_err(|_| "invalid TWO_SELF_ROLE_PANELS catalogue")?,
+                        "self role",
+                    );
+                }
+            }
+        }
+        // The shipped game catalogue is production deployment data. Session mode
+        // is roleless; never compare production roles to an unrelated test guild.
+        if game_picker_allowed(gates.mode) && !gates.dry_run && guild_id.to_string() == TWO_GUILD_ID
+        {
+            for pick in GAME_PICKS.iter().chain(PLATFORM_PICKS.iter()) {
+                targets
+                    .roles
+                    .insert(snowflake(pick.role_id)?, "onboarding game/platform");
+                if let Some(id) = pick.primary_channel_id {
+                    targets.channel(snowflake(id)?, false, false);
+                }
+                targets.channel(snowflake(pick.fallback_channel_id)?, false, false);
+            }
+        }
+        if env("TWO_AUTOMOD") == "1" {
+            let exempt = ids(&env("TWO_AUTOMOD_EXEMPT_CHANNEL_IDS"))?;
+            for (&id, target) in &mut targets.channels {
+                target.moderate = !exempt.contains(&id);
+            }
+        }
+        Ok(targets)
+    }
+
+    fn channel(&mut self, id: u64, post: bool, text_only: bool) {
+        let target = self.channels.entry(id).or_default();
+        target.post |= post;
+        target.text_only |= text_only;
+    }
+
+    fn ticket_category(&mut self, id: u64) {
+        let target = self.channels.entry(id).or_default();
+        target.category = true;
+    }
+}
+
+// Twilight builds requests only. Its ResponseFuture hides 429 retries, which
+// would not reacquire the shared lane. Errors never echo credentials or bodies.
+async fn read_discord<T: serde::de::DeserializeOwned>(
+    transport: &HyperTransport,
+    check: &'static str,
+    request: Result<Request, twilight_http::Error>,
+) -> Result<T, Check> {
+    let request =
+        request.map_err(|_| Check::fail(check, "Discord request invalid (checks stopped)"))?;
+    let (response, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        transport.send_request(&request),
+    )
+    .await
+    .map_err(|_| Check::fail(check, "Discord request timed out (lane held)"))?
+    .map_err(|_| {
+        Check::fail(
+            check,
+            "Discord send unavailable or admission held (checks stopped)",
+        )
+    })?;
+    if !(200..=299).contains(&response.status) {
+        return Err(Check::fail(
+            check,
+            format!("Discord HTTP {} (checks stopped)", response.status),
+        ));
+    }
+    serde_json::from_slice(&response.body)
+        .map_err(|_| Check::fail(check, "invalid Discord response"))
+}
+
+/// Privileged-intent rows: a requested intent the portal has not granted
+/// fails (Discord would close the gateway with 4014); a granted intent the
+/// runtime does not request warns.
+fn intent_checks(intents: Intents, flags: ApplicationFlags) -> Vec<(Status, &'static str, String)> {
+    // Source: https://docs.discord.com/developers/resources/application#application-object-application-flags
+    [
+        (
+            "Guild Members intent",
+            intents.contains(Intents::GUILD_MEMBERS),
+            flags.intersects(
+                ApplicationFlags::GATEWAY_GUILD_MEMBERS
+                    | ApplicationFlags::GATEWAY_GUILD_MEMBERS_LIMITED,
+            ),
+        ),
+        (
+            "Message Content intent",
+            intents.contains(Intents::MESSAGE_CONTENT),
+            flags.intersects(
+                ApplicationFlags::GATEWAY_MESSAGE_CONTENT
+                    | ApplicationFlags::GATEWAY_MESSAGE_CONTENT_LIMITED,
+            ),
+        ),
+        (
+            "Presence intent",
+            intents.contains(Intents::GUILD_PRESENCES),
+            flags.intersects(
+                ApplicationFlags::GATEWAY_PRESENCE | ApplicationFlags::GATEWAY_PRESENCE_LIMITED,
+            ),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, requested, enabled)| {
+        let status = if requested && !enabled {
+            Status::Fail
+        } else if !requested && enabled {
+            Status::Warn
+        } else {
+            Status::Pass
+        };
+        (
+            status,
+            name,
+            format!("runtime requested={requested}, portal enabled={enabled}"),
+        )
+    })
+    .collect()
+}
+
+async fn check_discord(
+    client: &Client,
+    transport: &HyperTransport,
+    targets: &Targets,
+    intents: Intents,
+    report: &mut Report,
+) -> Result<(), Check> {
+    let user: CurrentUser =
+        read_discord(transport, "token", client.current_user().try_into_request()).await?;
+    report.add(Status::Pass, "token", format!("bot ID {}", user.id));
+    let app: Application = read_discord(
+        transport,
+        "application",
+        client.current_user_application().try_into_request(),
+    )
+    .await?;
+    report.add(
+        Status::Pass,
+        "application",
+        format!("application ID {}", app.id),
+    );
+    let flags = app.flags.unwrap_or_else(ApplicationFlags::empty);
+    for (status, name, detail) in intent_checks(intents, flags) {
+        report.add(status, name, detail);
+    }
+    // The cutover's forced IDENTIFY spends one session start against a hard
+    // Discord daily limit, so the budget is read here through the same
+    // governed GET path: lane held, no retry, and any failed, timed-out or
+    // malformed read fails closed like every other check. Counts only; the
+    // token is never part of the detail.
+    let budget: BotConnectionInfo = read_discord(
+        transport,
+        "session start budget",
+        client.gateway().authed().try_into_request(),
+    )
+    .await?;
+    let limit = &budget.session_start_limit;
+    let status = if limit.remaining < SESSION_START_FAIL_FLOOR {
+        Status::Fail
+    } else if limit.remaining < SESSION_START_WARN_THRESHOLD {
+        Status::Warn
+    } else {
+        Status::Pass
+    };
+    report.add(
+        status,
+        "session start budget",
+        format!(
+            "remaining={} total={} reset_after_ms={} max_concurrency={}",
+            limit.remaining, limit.total, limit.reset_after, limit.max_concurrency
+        ),
+    );
+    let guild_id = Id::new(targets.guild_id);
+    let member: Member = read_discord(
+        transport,
+        "guild membership",
+        client.guild_member(guild_id, user.id).try_into_request(),
+    )
+    .await?;
+    let roles: Vec<Role> = read_discord(
+        transport,
+        "guild roles",
+        client.roles(guild_id).try_into_request(),
+    )
+    .await?;
+    if !roles.iter().any(|role| role.id.get() == targets.guild_id)
+        || member
+            .roles
+            .iter()
+            .any(|id| !roles.iter().any(|role| role.id == *id))
+    {
+        return Err(Check::fail(
+            "guild roles",
+            "incomplete role snapshot; cannot resolve permissions",
+        ));
+    }
+    report.add(
+        Status::Pass,
+        "guild membership",
+        format!("guild ID {}", targets.guild_id),
+    );
+    let base = guild_permissions(targets.guild_id, &member.roles, &roles);
+    let admin = base.contains(Permissions::ADMINISTRATOR);
+    if admin {
+        report.add(
+            Status::Warn,
+            "Administrator",
+            "bypasses channel overwrites, NOT role hierarchy; trim unnecessary access separately",
+        );
+    }
+    // Legacy funnel + internal-action grant (preflight.ts), with Administrator
+    // treated as granting permissions but always called out independently.
+    for (permission, name) in [
+        (Permissions::MANAGE_GUILD, "Manage Server"),
+        (Permissions::VIEW_CHANNEL, "View Channels"),
+        (Permissions::CREATE_INVITE, "Create Instant Invite"),
+        (Permissions::MANAGE_ROLES, "Manage Roles"),
+        (Permissions::MANAGE_EVENTS, "Manage Events"),
+        (Permissions::SEND_MESSAGES, "Send Messages"),
+    ] {
+        report.require(
+            admin || base.contains(permission),
+            name,
+            "guild-level funnel/internal-action permission",
+        );
+    }
+    let invites: Vec<Invite> = read_discord(
+        transport,
+        "invite list",
+        client.guild_invites(guild_id).try_into_request(),
+    )
+    .await?;
+    report.add(
+        Status::Pass,
+        "invite list",
+        format!("{} invites readable", invites.len()),
+    );
+    report.require(targets.level_roles_known, "level reward coverage", if targets.role_writes { "supply --level-role-ids from the guild's level_role_rewards, including an explicit empty CSV when none" } else { "role writes disabled by onboarding mode/dry-run" });
+    let highest = roles
+        .iter()
+        .filter(|role| role.id.get() == targets.guild_id || member.roles.contains(&role.id))
+        .max();
+    for (&id, source) in &targets.roles {
+        // Twilight Role::Ord handles equal-position roles by snowflake order.
+        let manageable = roles
+            .iter()
+            .find(|role| role.id.get() == id)
+            .is_some_and(|role| {
+                id != targets.guild_id
+                    && !role.managed
+                    && highest.is_some_and(|highest| role < highest)
+                    && (admin || base.contains(Permissions::MANAGE_ROLES))
+            });
+        report.require(
+            manageable,
+            format!("role {id}"),
+            format!("{source}: must exist, be unmanaged, and below the bot's highest role"),
+        );
+    }
+    if targets.channels.is_empty() {
+        report.add(
+            Status::Warn,
+            "channel coverage",
+            "no configured channel IDs; feature destinations were not checked",
+        );
+    }
+    // Any ticket key set without the other two is a fail-closed
+    // misconfiguration: tickets would silently stay disabled (or half-wired)
+    // instead of running with the intended category/staff/panel triple.
+    // Static guidance only; never echo values.
+    report.require(
+        targets.ticket_complete,
+        "ticket configuration",
+        "set DISCORD_TICKET_CATEGORY_ID, DISCORD_TICKET_STAFF_ROLE_ID and DISCORD_TICKET_PANEL_CHANNEL_ID together, or none",
+    );
+    for (&id, target) in &targets.channels {
+        let channel: Channel = read_discord(
+            transport,
+            "configured channel",
+            client.channel(Id::new(id)).try_into_request(),
+        )
+        .await?;
+        let correct_guild = channel.guild_id == Some(guild_id);
+        let text = matches!(
+            channel.kind,
+            ChannelType::GuildText | ChannelType::GuildAnnouncement
+        );
+        let category = channel.kind == ChannelType::GuildCategory;
+        let access = resolve_channel_access(
+            targets.guild_id,
+            user.id.get(),
+            &member.roles,
+            &roles,
+            channel.permission_overwrites.as_deref().unwrap_or_default(),
+        );
+        let usable = correct_guild
+            && (!target.text_only || text)
+            && (!target.category || category)
+            && access.view
+            && (!target.post || (access.send && access.embed))
+            && (!target.moderate || !text || access.manage_messages);
+        report.require(usable, format!("channel {id}"), format!(
+            "guild={correct_guild} type={:?} View={} Send={} Embed={} ManageMessages={} required: View{}{}{}",
+            channel.kind, access.view, access.send, access.embed, access.manage_messages,
+            if target.post { "/Send/Embed (text or announcement)" } else { "" },
+            if target.moderate && text { "/ManageMessages" } else { "" },
+            if target.category { "/GuildCategory" } else { "" },
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::print_stdout)] // CLI help only; preserve exact output bytes.
+fn print_usage() {
+    print!("{USAGE}");
+}
+
+async fn admission_transport(
+    token: String,
+    proxy: Option<String>,
+) -> Result<HyperTransport, Check> {
+    match std::env::var("TWO_DATABASE_URL") {
+        Ok(url) => {
+            // Threat-model F6: the shared website-jobs fence (validate + TLS
+            // enforce/apply + timeouts). Refusals read as the same redacted
+            // authority error. Lazy: no socket opens here; later wires fail closed.
+            let tls = crate::website_jobs::admission_tls_policy_from_env().map_err(|_| {
+                Check::fail("send admission", "runtime admission authority unavailable")
+            })?;
+            let pool = crate::website_jobs::admission_pool_with_tls(&url, tls).map_err(|_| {
+                Check::fail("send admission", "runtime admission authority unavailable")
+            })?;
+            let gate = PgSendAdmission::new(pool, &token)
+                .map_err(|_| Check::fail("send admission", "invalid credential namespace"))?;
+            HyperTransport::with_admission(token, proxy, std::sync::Arc::new(gate))
+                .map_err(|_| Check::fail("send admission", "invalid governed transport"))
+        }
+        // The explicit, validated loopback fixture remains offline/credential-free.
+        // A present but failed authority NEVER falls back to this path.
+        Err(std::env::VarError::NotPresent) if proxy.is_some() => {
+            HyperTransport::with_proxy(token, proxy)
+                .map_err(|_| Check::fail("test endpoint", "invalid loopback fixture"))
+        }
+        Err(_) => Err(Check::fail(
+            "send admission",
+            "set runtime TWO_DATABASE_URL before live checks",
+        )),
+    }
+}
+
+pub async fn dispatch(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_usage();
+        return 0;
+    }
+    let json = args.iter().any(|arg| arg == "--json");
+    let mut report = Report::default();
+    let mut level_ids = None;
+    let mut position = 0;
+    while position < args.len() {
+        match args[position].as_str() {
+            "--json" => {}
+            "--level-role-ids" if level_ids.is_none() && position + 1 < args.len() => {
+                position += 1;
+                level_ids = Some(args[position].as_str());
+            }
+            _ => {
+                report.checks.push(Check::fail(
+                    "arguments",
+                    "use preflight --help for supported options",
+                ));
+                report.render(json, 2);
+                return 2;
+            }
+        }
+        position += 1;
+    }
+    let targets = match Targets::from_env(level_ids) {
+        Ok(targets) => targets,
+        Err(error) => {
+            report.checks.push(Check::fail("configuration", error));
+            report.render(json, 2);
+            return 2;
+        }
+    };
+    // The alias is a legacy fallback for an absent primary only. A
+    // present-but-empty primary is a configuration error, never permission
+    // to try another credential.
+    let token = match std::env::var("DISCORD_TOKEN") {
+        Ok(token) => token,
+        Err(std::env::VarError::NotPresent) => env("DISCORD_BOT_TOKEN"),
+        Err(_) => String::new(),
+    };
+    if token.trim().is_empty() {
+        report
+            .checks
+            .push(Check::fail("token", "set DISCORD_TOKEN"));
+        report.render(json, 2);
+        return 2;
+    }
+    let activation =
+        crate::activation::BootActivation::from_token(Some(targets.guild_id), Some(&token));
+    let mut builder = Client::builder().token(token.clone()).ratelimiter(None);
+    let proxy = env("DISCORD_PREFLIGHT_API_BASE");
+    if !proxy.is_empty() {
+        // A credential-bearing test seam must not redirect to an arbitrary host.
+        let address = proxy
+            .strip_prefix("http://")
+            .and_then(|raw| raw.parse::<SocketAddr>().ok())
+            .filter(|address| address.ip().is_loopback() && address.port() != 0);
+        let Some(address) = address else {
+            report.checks.push(Check::fail(
+                "test endpoint",
+                "DISCORD_PREFLIGHT_API_BASE must be a loopback http://IP:port",
+            ));
+            report.render(json, 2);
+            return 2;
+        };
+        builder = builder.proxy(address.to_string(), true);
+    }
+    let proxy = (!proxy.is_empty()).then_some(proxy);
+    let transport = match admission_transport(token, proxy).await {
+        Ok(transport) => transport,
+        Err(check) => {
+            report.checks.push(check);
+            report.render(json, 2);
+            return 2;
+        }
+    };
+    if let Err(check) = check_discord(
+        &builder.build(),
+        &transport,
+        &targets,
+        crate::gateway::intents_from_env(&activation),
+        &mut report,
+    )
+    .await
+    {
+        report.checks.push(check);
+    }
+    let code = i32::from(
+        report
+            .checks
+            .iter()
+            .any(|check| check.status == Status::Fail),
+    );
+    report.render(json, code);
+    code
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn presence_intent_needs_the_portal_grant() {
+        use twilight_model::oauth::ApplicationFlags;
+        let row = |intents, flags| {
+            super::intent_checks(intents, flags)
+                .into_iter()
+                .find(|(_, name, _)| *name == "Presence intent")
+                .map(|(status, _, _)| status)
+                .expect("presence row")
+        };
+        let presences = Intents::GUILD_PRESENCES;
+        assert!(matches!(
+            row(presences, ApplicationFlags::empty()),
+            super::Status::Fail
+        ));
+        assert!(matches!(
+            row(presences, ApplicationFlags::GATEWAY_PRESENCE_LIMITED),
+            super::Status::Pass
+        ));
+        assert!(matches!(
+            row(presences, ApplicationFlags::GATEWAY_PRESENCE),
+            super::Status::Pass
+        ));
+        assert!(matches!(
+            row(Intents::empty(), ApplicationFlags::GATEWAY_PRESENCE_LIMITED),
+            super::Status::Warn
+        ));
+        assert!(matches!(
+            row(Intents::empty(), ApplicationFlags::empty()),
+            super::Status::Pass
+        ));
+    }
+
+    use super::*;
+
+    #[test]
+    fn admission_query_guard_child() {
+        if std::env::var_os("ADMISSION_BOOTSTRAP_PROBE").is_none() {
+            return;
+        }
+        crate::admission_test_support::capture_probe(async {
+            let error = admission_transport(
+                "fixture-token".to_owned(),
+                Some("http://127.0.0.1:1".to_owned()),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.detail, "runtime admission authority unavailable");
+        });
+    }
+
+    #[test]
+    fn admission_query_guard_redacts_dependency_logs() {
+        crate::admission_test_support::run_probe("preflight::tests::admission_query_guard_child");
+    }
+
+    /// Threat-model F6: the shared admission fence (same helper as the website
+    /// jobs) refuses plaintext, unverified and wrong-host URLs with fixed
+    /// strings, and the `LocalOnly` happy path builds a lazy pool with no
+    /// socket. Explicit policies, so deterministic under any process setting.
+    #[test]
+    fn admission_tls_fence_refuses_plaintext_and_wrong_hosts() {
+        use two_bot_core::database_tls::TlsPolicy;
+        let cases = [
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                TlsPolicy::Required,
+                "database sslmode does not require TLS",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db",
+                TlsPolicy::Required,
+                "database URL must set sslmode under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@fixture-host/fixture-db?sslmode=verify-full",
+                TlsPolicy::Required,
+                "local database host is refused under the required TLS policy",
+            ),
+            (
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                TlsPolicy::LocalOnly,
+                "remote database host is refused under the local-only TLS policy",
+            ),
+        ];
+        let capture = crate::tracing_capture::Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for (url, policy, expected) in cases {
+                    let error =
+                        crate::website_jobs::admission_pool_with_tls(url, policy).unwrap_err();
+                    assert_eq!(error, expected, "{url}");
+                    assert!(!error.contains("fixture"), "TLS refusal echoed the URL");
+                }
+                for (url, policy) in [
+                    (
+                        "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+                        TlsPolicy::LocalOnly,
+                    ),
+                    (
+                        "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=verify-full",
+                        TlsPolicy::Required,
+                    ),
+                ] {
+                    let pool =
+                        crate::website_jobs::admission_pool_with_tls(url, policy).unwrap();
+                    assert_eq!(pool.size(), 0);
+                    pool.close().await;
+                }
+                tracing::warn!("preflight admission capture remains active");
+            });
+        });
+        let text = capture.text();
+        assert!(text.contains("preflight admission capture remains active"));
+        assert!(!text.contains("fixture"), "TLS refusal reached logs");
+    }
+
+    /// Child-process probe for the transport wiring: refusal reads as the same
+    /// redacted authority error, and the `LocalOnly` happy path builds without
+    /// a socket. Runs only when `ADMISSION_TLS_PROBE` is set (see the parent).
+    #[test]
+    fn admission_tls_guard_child() {
+        if std::env::var_os("ADMISSION_TLS_PROBE").is_none() {
+            return;
+        }
+        let capture = crate::tracing_capture::Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                if std::env::var("ADMISSION_TLS_MODE").as_deref() == Ok("happy") {
+                    let transport = admission_transport("fixture-token".to_owned(), None).await;
+                    assert!(
+                        transport.is_ok(),
+                        "local-only happy path must build without a socket"
+                    );
+                } else {
+                    let error = admission_transport("fixture-token".to_owned(), None)
+                        .await
+                        .err()
+                        .unwrap();
+                    assert_eq!(error.detail, "runtime admission authority unavailable");
+                    assert!(!error.detail.contains("fixture"));
+                }
+                tracing::warn!("preflight TLS capture remains active");
+            });
+        });
+        let text = capture.text();
+        assert!(text.contains("preflight TLS capture remains active"));
+        assert!(!text.contains("fixture"), "TLS refusal reached logs");
+    }
+
+    /// Parent: re-run the probe above in env-cleared children, once refusing a
+    /// remote plaintext URL under the default `Required` policy and once
+    /// accepting a loopback URL under `LocalOnly`. Separate processes avoid
+    /// process-global environment races with the parallel suite.
+    #[test]
+    fn admission_tls_guard_redacts_dependency_logs() {
+        for (mode, url, tls) in [
+            (
+                "refusal",
+                "postgres://fixture-user:fixture-db-password@ep-fixture-host.us-east-2.aws.neon.tech/fixture-db?sslmode=disable",
+                None,
+            ),
+            (
+                "happy",
+                "postgres://fixture:fixture-password@127.0.0.1:1/fixture?sslmode=disable",
+                Some("local-only"),
+            ),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["preflight::tests::admission_tls_guard_child", "--exact", "--nocapture"])
+                .env_clear()
+                .env("ADMISSION_TLS_PROBE", "1")
+                .env("ADMISSION_TLS_MODE", mode)
+                .env("TWO_DATABASE_URL", url);
+            if let Some(policy) = tls {
+                command.env("TWO_DATABASE_TLS", policy);
+            }
+            let output = command.output().expect("run isolated TLS probe");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "TLS {mode} probe failed: {stderr}"
+            );
+            assert!(stdout.contains("running 1 test"));
+            for text in [&stdout, &stderr] {
+                assert!(!text.contains("fixture"), "TLS {mode} probe leaked");
+            }
+        }
+    }
+
+    fn vars(guild: &str, mode: &str) -> HashMap<String, String> {
+        [
+            ("GUILD_ID".into(), guild.into()),
+            ("TWO_ONBOARDING_MODE".into(), mode.into()),
+        ]
+        .into()
+    }
+
+    #[test]
+    fn onboarding_catalogue_is_guild_scoped_and_roleless_session_is_honored() {
+        for (guild, mode, expected_roles) in [
+            (TWO_GUILD_ID, "legacy", 15),
+            (TWO_GUILD_ID, "anchor", 15),
+            (TWO_GUILD_ID, "session", 0),
+            ("2222", "legacy", 0),
+        ] {
+            let targets = Targets::from_map(&vars(guild, mode), Some("")).unwrap();
+            assert_eq!(targets.roles.len(), expected_roles, "{guild}/{mode}");
+            if expected_roles > 0 {
+                assert_eq!(targets.channels.len(), 4);
+            }
+        }
+        let mut env = vars(TWO_GUILD_ID, "legacy");
+        env.insert("TWO_ONBOARDING_DRY_RUN".into(), "1".into());
+        let targets = Targets::from_map(&env, None).unwrap();
+        assert!(
+            targets.roles.is_empty() && targets.channels.is_empty() && targets.level_roles_known
+        );
+    }
+
+    #[test]
+    fn target_collection_deduplicates_and_combines_channel_requirements() {
+        let mut env = vars("2222", "session");
+        env.insert("DISCORD_LANDING_CHANNEL_IDS".into(), "6666,7777".into());
+        env.insert("TWO_COMMUNITY_HUMAN_CHANNEL_IDS".into(), "6666".into());
+        env.insert("TWO_AUTOMOD".into(), "1".into());
+        env.insert("TWO_AUTOMOD_EXEMPT_CHANNEL_IDS".into(), "7777".into());
+        // Strict parser fixture: valid snowflakes plus the required
+        // id/messageId/mode/option key/label/permissions shape.
+        env.insert(
+            "TWO_SELF_ROLE_PANELS".into(),
+            r#"[{"id":"games","channelId":"10000000000000000007","messageId":"10000000000000000008","mode":"button","options":[{"key":"chess","label":"Chess","roleId":"10000000000000000004","permissions":"0"}]}]"#.into(),
+        );
+        let targets = Targets::from_map(&env, None).unwrap();
+        assert_eq!(targets.channels.len(), 3);
+        assert!(targets.channels[&6666].post && targets.channels[&6666].moderate);
+        assert!(targets.channels[&7777].post && !targets.channels[&7777].moderate);
+        assert!(
+            targets.channels[&10_000_000_000_000_000_007].post
+                && targets.channels[&10_000_000_000_000_000_007].moderate
+        );
+        assert_eq!(targets.roles[&10_000_000_000_000_000_004], "self role");
+    }
+
+    #[test]
+    fn self_role_catalogue_rejects_boot_refused_bounds() {
+        // Mirrors the boot parser bounds: >20 reactions, >100-unit button
+        // custom ids and >80-unit button labels fail preflight with a static,
+        // secret-free message before any REST.
+        let valid_option = |key: &str, role_suffix: u64| {
+            serde_json::json!({
+                "key": key, "label": "Chess",
+                "roleId": format!("10000000000000{role_suffix:04}"),
+                "permissions": "0", "emoji": key,
+            })
+        };
+        let reaction_many = (0..21)
+            .map(|i| valid_option(&format!("k{i:02}"), 100 + i as u64))
+            .collect::<Vec<_>>();
+        let too_many = serde_json::json!([{
+            "id": "react", "channelId": "100000000000000007",
+            "messageId": "100000000000000008", "mode": "reaction",
+            "options": reaction_many,
+        }])
+        .to_string();
+        let oversized_id = serde_json::json!([{
+            "id": "p".repeat(60), "channelId": "100000000000000007",
+            "messageId": "100000000000000008", "mode": "button",
+            "options": [{
+                "key": "k".repeat(26), "label": "Chess",
+                "roleId": "100000000000000004", "permissions": "0",
+            }],
+        }])
+        .to_string();
+        let oversized_label = serde_json::json!([{
+            "id": "games", "channelId": "100000000000000007",
+            "messageId": "100000000000000008", "mode": "button",
+            "options": [{
+                "key": "chess", "label": "a".repeat(81),
+                "roleId": "100000000000000004", "permissions": "0",
+            }],
+        }])
+        .to_string();
+        for raw in [too_many, oversized_id, oversized_label] {
+            let mut env = vars("2222", "session");
+            env.insert("TWO_SELF_ROLE_PANELS".into(), raw);
+            let err = Targets::from_map(&env, None).expect_err("boot-refused catalogue");
+            assert_eq!(err, "invalid TWO_SELF_ROLE_PANELS catalogue");
+        }
+    }
+}

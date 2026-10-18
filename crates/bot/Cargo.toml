@@ -1,0 +1,54 @@
+[package]
+name = "two-bot"
+version = "0.4.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "two-bot"
+path = "src/main.rs"
+
+# Intra-workspace path deps carry an explicit version (still resolved via
+# path): cargo-deny `wildcards = "deny"` rejects version-less deps, and the
+# version pins the API contract between crates at a glance.
+[dependencies]
+two-bot-core = { version = "0.4.0", path = "../core", features = ["db"] }
+two-bot-discord = { version = "0.4.0", path = "../discord", features = ["db"] }
+two-bot-store = { version = "0.4.0", path = "../store" }
+two-bot-cutover = { version = "0.4.0", path = "../cutover" }
+# Relay/audit ids: 16 CSPRNG bytes hex-encoded (same shape as core's
+# internal_actions nonces).
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+time = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+# Sole rustls crypto provider (ring): twilight's Shard build panics without
+# exactly one provider feature enabled. Declared here (not on a lib) so the
+# release binary and `cargo test` share the same provider.
+rustls = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-log = { workspace = true }
+tracing-subscriber = { workspace = true }
+twilight-cache-inmemory = { workspace = true }
+twilight-gateway = { workspace = true }
+twilight-http = { workspace = true }
+twilight-model = { workspace = true }
+
+[dev-dependencies]
+two-bot-discord = { version = "0.4.0", path = "../discord", features = ["test-support"] }
+# The shared loopback Discord fixture uses SinkExt only in integration tests.
+futures-util = { workspace = true, features = ["sink"] }
+two-bot-testsupport = { version = "0.4.0", path = "../testsupport" }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-websockets = { workspace = true }
