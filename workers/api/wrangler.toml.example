@@ -1,0 +1,29 @@
+# Copy to wrangler.toml and fill in IDs. Never commit the real file:
+# secrets live only in Cloudflare (Worker secrets / Hyperdrive) and CI secrets.
+name = "nntune-api"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[vars]
+# Public, non-secret config only.
+RP_ID = "example.com"
+RP_ORIGIN = "https://example.com"
+SESSION_TTL_SECS = "86400"
+
+# Hyperdrive binding for PlanetScale Postgres (ID filled per environment).
+# [[hyperdrive]]
+# binding = "HYPERDRIVE"
+# id = "<fill in staging/prod id>"
+
+# Secrets (set with `wrangler secret put`, never here). All *BASE64 values
+# are unpadded base64url (43 chars for 32 bytes; generate with
+# `openssl rand 32 | basenc --base64url | tr -d '='`, decode with
+# `nntune_api::b64::decode` — padded std base64 is rejected):
+#   VAULT_KEK_BASE64              32-byte KEK, unpadded base64url (versioned; rotate via rewrap job)
+#   VAULT_KEK_VERSION             integer version matching the KEK
+#   SESSION_SECRET_BASE64         HMAC secret for session cookies (256-bit, unpadded base64url)
+#   SESSION_SECRET_PREVIOUS_BASE64  verify-only previous HMAC secret: set ONLY
+#                                 during a rotation window, deleted at its end.
+#                                 See docs/security/session-secret-rotation.md —
+#                                 never two live minting secrets.
+#   EMAIL_API_KEY                 transactional email provider key (magic-link delivery)

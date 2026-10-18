@@ -1,0 +1,257 @@
+name: e2e-staging
+
+# Staging E2E + synthetic smoke for NNTune v2.
+# Runs the Playwright suite in e2e/ against STAGING_BASE_URL (behind
+# Cloudflare Access via the QA service-token pair). The deployment lane must
+# sequence this after staging deploy and require its result on the deployed
+# SHA for prod promotion. That integration is not established by this file.
+#
+# Pre-deploy there is no staging yet: jobs skip at step level with a notice
+# when secrets.STAGING_BASE_URL is unset. Once staging is configured the
+# same file fails closed — no workflow change needed for activation.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Synthetic monitor cadence (off-minute to avoid thundering herd).
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-staging
+  cancel-in-progress: false
+
+jobs:
+  synthetic:
+    name: synthetic smoke (health)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check staging configuration
+        id: staging
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STAGING_BASE_URL:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::STAGING_BASE_URL not configured (pre-deploy) — synthetic smoke skips."
+          else
+            if [ -z "${CF_ACCESS_CLIENT_ID:-}" ] || [ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+              echo "::error::Configured staging requires CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET."
+              exit 1
+            fi
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        if: steps.staging.outputs.configured == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install dependencies
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright chromium
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run synthetic smoke
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+        run: npm run e2e:smoke
+
+      - name: Sanitize failure artifacts (strip credential-bearing snapshots)
+        if: failure() && steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
+          SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
+          SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+        run: |
+          set -euo pipefail
+          # Playwright 1.55 writes test-results/**/error-context.md on any failed
+          # page test — an ARIA snapshot rendering filled input values, including
+          # the BYOP password — and the junit reporter embeds failure messages
+          # (e.g. toHaveValue Received strings) that can carry the same filled
+          # secrets. Belt-and-braces: delete error-context.md AND the whole
+          # playwright-report/ dir, then scrub secret values from every remaining
+          # file under test-results/ (junit.xml) so the uploaded artifact can
+          # never carry secrets. Only test-results/ (junit) is uploaded below.
+          find test-results -name 'error-context.md' -delete 2>/dev/null || true
+          rm -rf playwright-report 2>/dev/null || true
+          python3 - <<'PY'
+          import os
+          import pathlib
+          root = pathlib.Path("test-results")
+          values = [
+              os.environ.get("CF_ACCESS_CLIENT_ID", ""),
+              os.environ.get("CF_ACCESS_CLIENT_SECRET", ""),
+              os.environ.get("QA_AUTH_TOKEN", ""),
+              os.environ.get("SYNTHETIC_NNTP_HOST", ""),
+              os.environ.get("SYNTHETIC_NNTP_USER", ""),
+              os.environ.get("SYNTHETIC_NNTP_PASS", ""),
+          ]
+          values = [v for v in values if v]
+          if root.is_dir() and values:
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  try:
+                      data = path.read_bytes()
+                  except OSError:
+                      continue
+                  for value in values:
+                      data = data.replace(value.encode(), b"***REDACTED***")
+                  path.write_bytes(data)
+          PY
+          echo "sanitized: error-context.md and playwright-report/ removed, test-results scrubbed"
+
+      - name: Upload failure artifacts
+        if: failure() && steps.staging.outputs.configured == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: e2e-synthetic-report
+          path: |
+            e2e/test-results/
+          retention-days: 7
+
+  e2e:
+    name: full journey (signup → byop → ingest → meter → limits)
+    needs: [synthetic]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check staging configuration
+        id: staging
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STAGING_BASE_URL:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::STAGING_BASE_URL not configured (pre-deploy) — full journey skips."
+          else
+            if [ -z "${CF_ACCESS_CLIENT_ID:-}" ] || [ -z "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+              echo "::error::Configured staging requires CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET."
+              exit 1
+            fi
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        if: steps.staging.outputs.configured == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install dependencies
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright chromium
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run full journey
+        if: steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        env:
+          STAGING_BASE_URL: ${{ secrets.STAGING_BASE_URL }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
+          SYNTHETIC_NNTP_PORT: ${{ secrets.SYNTHETIC_NNTP_PORT }}
+          SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
+          SYNTHETIC_NNTP_TLS: ${{ secrets.SYNTHETIC_NNTP_TLS }}
+          SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+        run: npm run e2e:staging
+
+      - name: Sanitize failure artifacts (strip credential-bearing snapshots)
+        if: failure() && steps.staging.outputs.configured == 'true'
+        working-directory: e2e
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          QA_AUTH_TOKEN: ${{ secrets.QA_AUTH_TOKEN }}
+          SYNTHETIC_NNTP_HOST: ${{ secrets.SYNTHETIC_NNTP_HOST }}
+          SYNTHETIC_NNTP_USER: ${{ secrets.SYNTHETIC_NNTP_USER }}
+          SYNTHETIC_NNTP_PASS: ${{ secrets.SYNTHETIC_NNTP_PASS }}
+        run: |
+          set -euo pipefail
+          # Same credential-bearing paths as the synthetic job above:
+          # error-context.md renders filled secrets and junit failure messages
+          # (e.g. toHaveValue Received strings) can carry the same filled
+          # values. Strip error-context.md plus the whole playwright-report/
+          # dir, then scrub secret values from test-results/ (junit.xml)
+          # before upload (junit-only evidence in test-results/).
+          find test-results -name 'error-context.md' -delete 2>/dev/null || true
+          rm -rf playwright-report 2>/dev/null || true
+          python3 - <<'PY'
+          import os
+          import pathlib
+          root = pathlib.Path("test-results")
+          values = [
+              os.environ.get("CF_ACCESS_CLIENT_ID", ""),
+              os.environ.get("CF_ACCESS_CLIENT_SECRET", ""),
+              os.environ.get("QA_AUTH_TOKEN", ""),
+              os.environ.get("SYNTHETIC_NNTP_HOST", ""),
+              os.environ.get("SYNTHETIC_NNTP_USER", ""),
+              os.environ.get("SYNTHETIC_NNTP_PASS", ""),
+          ]
+          values = [v for v in values if v]
+          if root.is_dir() and values:
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  try:
+                      data = path.read_bytes()
+                  except OSError:
+                      continue
+                  for value in values:
+                      data = data.replace(value.encode(), b"***REDACTED***")
+                  path.write_bytes(data)
+          PY
+          echo "sanitized: error-context.md and playwright-report/ removed, test-results scrubbed"
+
+      - name: Upload failure artifacts
+        if: failure() && steps.staging.outputs.configured == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: e2e-journey-report
+          path: |
+            e2e/test-results/
+          retention-days: 7

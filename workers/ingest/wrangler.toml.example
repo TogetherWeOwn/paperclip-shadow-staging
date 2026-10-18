@@ -1,0 +1,66 @@
+# Binding map for workers/ingest. Copy to wrangler.toml locally; replace every
+# `<...>` placeholder with the real id and never commit real ids or secrets
+# (see repo root .gitignore).
+name = "nntune-ingest"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+# Slice 2: Queue producer (code: src/dispatch.rs, src/queue.rs). The routes
+# only produce; nothing consumes yet (see below), so every accepted enqueue
+# waits in the queue until the consumer ships.
+[[queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "nntune-ingest-jobs"
+
+# Consumer: NOT YET. This crate has only `event(fetch)` — no `event(queue)`
+# handler — so declaring this worker a consumer would deliver every message
+# to a handler that does not exist (retried `max_retries` times, then
+# dropped, while callers saw 202 queued). Uncomment together with the Queue
+# handler and a dead-letter queue, e.g.:
+#
+# [[queues.consumers]]
+# queue = "nntune-ingest-jobs"
+# max_batch_size = 10
+# Keep max_retries = PAYLOAD_RETRY_ATTEMPTS (4) in src/dispatch.rs: the
+# payload-fetch backoff (5/15/30/60 s, 110 s cumulative) needs all four
+# retries to cover the ~60 s KV lag plus the edge-cached negative-lookup
+# window (consumer reads with cacheTtl 30).
+# max_retries = 4
+# [[queues.consumers.dead_letter_queue]]
+# queue = "nntune-ingest-dlq"
+
+# Workflows: NOT YET. workers-rs 0.3 has no Workflow client and this crate
+# exports no Workflow class, and `[[workflows]]` requires a `class_name`, so
+# any entry here is rejected at deploy. Orchestration until then is Queue
+# redelivery + job checkpoints (src/jobs.rs). Re-add with `class_name` when
+# the Workflow class ships.
+
+# Slice 2: library writes (code: src/library.rs).
+[[hyperdrive]]
+binding = "LIBRARY_DB"
+id = "<HYPERDRIVE_ID_FOR_nntunev2>"
+
+# Checkpoint store for the Queue consumer (job_id -> JobCheckpoint JSON).
+[[kv_namespaces]]
+binding = "INGEST_STATE"
+id = "<KV_NAMESPACE_ID>"
+
+# Upload payload store (code: src/lib.rs store_upload_payload). The route
+# writes the approved NZB bytes here under the content-addressed
+# `nzb:sha256:<hex>` key from the Queue message before enqueueing; the
+# consumer fetches them by that key. (Bytes cannot ride the Queue message:
+# 2 MiB vs the 128 KB message limit.)
+[[kv_namespaces]]
+binding = "INGEST_PAYLOADS"
+id = "<KV_NAMESPACE_ID_FOR_PAYLOADS>"
+
+# Slice 2: usage metering (code: src/metering.rs).
+[[analytics_engine_datasets]]
+binding = "INGEST_METER"
+dataset = "nntune_ingest_meter"
+
+# Slice 2: repair dispatch target (code: src/repair.rs). The Container service
+# name lands with the repair runtime; until then this stays a placeholder.
+[[services]]
+binding = "REPAIR_CONTAINER"
+service = "<REPAIR_CONTAINER_SERVICE>"

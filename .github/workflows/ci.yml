@@ -1,0 +1,253 @@
+name: ci
+
+# `ci-ok` is a required check on main: its NAME must stay `ci-ok`, and every
+# real job id must be listed in its `needs`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Merge queue validation: every required check must report on
+  # the queue's temporary merge commit, or the queue stalls on "Expected —
+  # waiting". merge_group runs are never cancelled (see concurrency below).
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # merge_group refs are per-queue-entry (`gh-readonly-queue/...`) and must
+  # run to completion: cancelling a queue validation run ejects the entry.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: "24"
+  PNPM_VERSION: 10.34.7
+
+jobs:
+  rust-test:
+    name: rust test (native)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
+      # (2026-08-06); re-pin deliberately, never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # The workspace includes nntune-core and the stream crate; run all native
+      # tests and lint every target so stream regressions stay on the gate.
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  rust-wasm:
+    name: rust check (wasm32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
+      # (2026-08-06); re-pin deliberately, never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Scalar core (no transport features) and the Workers transport build.
+      - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
+      - run: cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features --features worker-transport
+      # The simd128 yEnc fast path must keep compiling (Workers run V8 with
+      # Wasm SIMD; the deploy enables it via this RUSTFLAGS).
+      - run: RUSTFLAGS="-C target-feature=+simd128" cargo check -p nntune-core --target wasm32-unknown-unknown --no-default-features
+
+  # Public-repo hygiene: fail on internal tracker ids (TOG-<digits>),
+  # internal hostnames, instance-UI paths and agent names in tracked text.
+  # CONTRIBUTING.md states the rule; this job enforces it (F-HYG-02).
+  public-text:
+    name: public-text
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Lint public text for internal identifiers
+        run: python3 .github/scripts/public_text_lint.py
+      - name: Unit-test the lint
+        run: python3 .github/scripts/test_public_text_lint.py
+
+  api:
+    name: api
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHA: `stable` branch HEAD (2026-10-09); re-pin deliberately,
+      # never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - run: cargo test --manifest-path workers/api/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path workers/api/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path workers/api/Cargo.toml -- --check
+      # The Worker deploys to wasm32: the crate must check on that target
+      # (native-only CI once missed a getrandom/RNG breakage there).
+      - run: cargo check --manifest-path workers/api/Cargo.toml --target wasm32-unknown-unknown
+
+  rust-mb:
+    name: rust (workers/mb)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Pinned SHAs: `stable` branch HEAD (2026-10-09) and `v2` branch HEAD
+      # (2026-08-06); re-pin deliberately, never float.
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --manifest-path workers/mb/Cargo.toml --all-targets
+      - run: cargo clippy --manifest-path workers/mb/Cargo.toml --all-targets -- -D warnings
+      - run: cargo fmt --manifest-path workers/mb/Cargo.toml -- --check
+      # The Worker deploys to wasm32: the crate must check on that target
+      # (native-only CI once missed a getrandom/RNG breakage there).
+      - run: cargo check --manifest-path workers/mb/Cargo.toml --target wasm32-unknown-unknown
+
+  # E2E harness static checks: typecheck + spec discovery with no staging
+  # needed, so every PR proves the harness still compiles. The live suite
+  # runs in e2e-staging.yml (post-deploy). Keep this job id in ci-ok's needs.
+  e2e-lint:
+    name: e2e-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+
+      - name: Install e2e dependencies
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Playwright chromium (browser-level self-tests)
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Typecheck
+        working-directory: e2e
+        run: npm run typecheck
+
+      - name: Helper self-tests (fail-closed behavior, no staging)
+        working-directory: e2e
+        run: npm run test:unit
+
+      - name: List specs (compiles the suite without staging)
+        working-directory: e2e
+        run: npm run e2e:list
+
+  svelte-check:
+    name: svelte-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+
+  vitest:
+    name: vitest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+
+  web-build:
+    name: web-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+  # Aggregate required check: every dependency must succeed, including
+  # when a required job fails, is cancelled, or is skipped.
+  ci-ok:
+    name: ci-ok
+    needs: [rust-test, rust-wasm, api, rust-mb, e2e-lint, svelte-check, vitest, web-build, public-text]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          if ! jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS_JSON" > /dev/null; then
+            echo "ci-ok: a required job did not succeed"
+            exit 1
+          fi
+          echo "ci-ok: all required jobs passed"
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}

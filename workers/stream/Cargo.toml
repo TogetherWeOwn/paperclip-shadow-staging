@@ -1,0 +1,10 @@
+[package]
+name = "nntune-stream"
+version = "0.1.0"
+edition = "2021"
+description = "NNTune v2 stream worker: per-user NNTP pool + Range streaming play path (portable Rust core of the Cloudflare Worker / Durable Object)"
+license = "MIT"
+
+[lib]
+name = "nntune_stream"
+path = "src/lib.rs"

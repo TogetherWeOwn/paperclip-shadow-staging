@@ -1,0 +1,57 @@
+name: codeql
+
+# CodeQL scans JavaScript/TypeScript and GitHub Actions; CodeQL has no Rust support.
+# Rust coverage comes from cargo audit/clippy jobs the scaffold card adds.
+# Feeds the `CodeQL` code_scanning rule on main.
+
+# Web code lives in apps/web: run when JS/TS or workflow files change, so
+# docs/Rust-only PRs do not burn a needless scan. The code_scanning ruleset
+# rule follows once scans pass on real code.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'apps/web/**', '.github/workflows/**']
+  # Merge queue validation: report on merge_group now so a future
+  # code_scanning required rule never stalls the queue. Path filtering still
+  # applies to the queue's merge diff.
+  merge_group:
+  push:
+    branches: [main]
+    paths: ['**.js', '**.jsx', '**.ts', '**.tsx', 'apps/web/**', '.github/workflows/**']
+  schedule:
+    - cron: '23 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Never cancel a queue validation run (see ci.yml).
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'merge_group' }}
+
+jobs:
+  analyze:
+    name: analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4 (2026-10-08)
+        with:
+          languages: ${{ matrix.language }}
+
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4 (2026-10-08)
+        with:
+          category: "/language:${{ matrix.language }}"

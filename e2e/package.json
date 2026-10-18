@@ -1,0 +1,19 @@
+{
+  "name": "nntunev2-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright E2E + staging smoke harness for NNTune v2 (public repo: secret names only, never values)",
+  "type": "module",
+  "scripts": {
+    "e2e:staging": "playwright test --config=playwright.config.ts",
+    "e2e:smoke": "playwright test --config=playwright.config.ts --project=staging tests/health.spec.ts",
+    "e2e:list": "playwright test --config=playwright.config.ts --list",
+    "test:unit": "playwright test --config=playwright.config.ts tests/helpers.spec.ts tests/workflows.spec.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.1",
+    "@types/node": "22.7.4",
+    "typescript": "5.6.3"
+  }
+}

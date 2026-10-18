@@ -1,0 +1,33 @@
+# NNTune v2 `stream` Worker + per-user NNTP pool Durable Object.
+#
+# Deploy contract (provisioned by the DevOps card; no secrets here):
+# - One Durable Object instance per user (`NntpPool`, id = user id) owns the
+#   `nntune-stream` pool state machine (leases, lanes, quarantine).
+# - The Worker authorizes each play against a signed grant from the `api`
+#   Worker, serves `200`/`206` from R2 on hits, and streams misses through
+#   the pool while completing the R2 multipart write (see src/play.rs).
+# - Metering sinks to the `meter` Analytics Engine dataset; the usage ledger
+#   itself lives in PlanetScale Postgres via Hyperdrive (api card owns it).
+
+name = "nntune-stream"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+[[durable_objects.bindings]]
+name = "NNTP_POOL"
+class_name = "NntpPool"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NntpPool"]
+
+[[r2_buckets]]
+binding = "AUDIO_CACHE"
+bucket_name = "nntune-audio-cache"
+
+[[analytics_engine_datasets]]
+binding = "METER"
+dataset = "nntune_meter"
+
+# KV (config) and Hyperdrive (usage ledger reads) are bound here once the
+# accounts/auth card lands their names; the Rust core needs no changes.

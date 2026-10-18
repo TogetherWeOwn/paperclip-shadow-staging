@@ -1,0 +1,70 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock
+.cargo/
+
+# Rust wasm / workers
+/pkg/
+/wasm-pack.log
+/workers/*/*.wasm
+
+# Node / SvelteKit
+node_modules/
+.svelte-kit/
+build/
+dist/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+# Web app ships its lockfile for reproducible installs until the monorepo
+# scaffold card moves to a single root lockfile.
+!apps/web/pnpm-lock.yaml
+.output/
+.vercel/
+.netlify/
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+wrangler.toml.bak
+
+# Env / secrets — never commit
+.env
+.env.*
+!.env.example
+
+# PlanetScale / DB
+*.sql.gz
+/dump/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# Test / coverage
+/coverage/
+lcov.info
+tarpaulin-report.html
+
+# Python bytecode: embeds absolute build paths, must never be tracked
+# (public repo). The public-text lint rejects these paths if committed.
+__pycache__/
+*.pyc
+*.pyo
+
+# Playwright (nntunev2 e2e harness)
+/e2e/playwright-report/
+/e2e/test-results/
+/e2e/dist/
+playwright-report/
+test-results/
+
+# The e2e harness pins its own lockfile for reproducible CI installs.
+!e2e/package-lock.json

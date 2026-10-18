@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/nntune-core", "workers/stream"]
+# workers/api, workers/ingest and workers/mb are standalone crates (no
+# [workspace] table): exclude them so this parent workspace never swallows
+# them. Revisit if the scaffold card unifies the workspace.
+exclude = ["workers/api", "workers/ingest", "workers/mb"]
+resolver = "2"

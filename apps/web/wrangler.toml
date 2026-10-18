@@ -1,0 +1,23 @@
+# NNTune web frontend (SvelteKit via adapter-cloudflare). Build first with
+# `pnpm --dir apps/web build`, then `wrangler deploy --env <staging|production>`
+# (see .github/workflows/deploy.yml). `main`/`assets` paths are the
+# adapter-cloudflare output layout (svelte.dev/docs/kit/adapter-cloudflare).
+# No secrets here: the web frontend needs no bindings yet.
+name = "nntune-web"
+main = ".svelte-kit/cloudflare/_worker.js"
+compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_als"]
+
+[assets]
+binding = "ASSETS"
+directory = ".svelte-kit/cloudflare"
+
+# Required for `wrangler preview` (per-PR preview job in deploy.yml).
+# Empty block is intentional: assets/compat stay top-level.
+[previews]
+
+[env.staging]
+name = "nntune-web-staging"
+
+[env.production]
+name = "nntune-web"

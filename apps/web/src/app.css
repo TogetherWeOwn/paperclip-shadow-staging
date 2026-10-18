@@ -1,0 +1,56 @@
+@import './lib/design/tokens.css';
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	background: var(--nt-bg);
+	color: var(--nt-fg);
+	font-family: var(--nt-font);
+	font-size: var(--nt-font-size-base);
+	line-height: var(--nt-line);
+}
+
+a {
+	color: var(--nt-accent);
+}
+
+:focus-visible {
+	outline: 2px solid var(--nt-accent);
+	outline-offset: 2px;
+}
+
+.nt-wrap {
+	max-width: var(--nt-max-width);
+	margin-inline: auto;
+	padding-inline: var(--nt-space-3);
+}
+
+.nt-button {
+	display: inline-block;
+	padding: var(--nt-space-2) var(--nt-space-4);
+	border-radius: var(--nt-radius);
+	background: var(--nt-accent);
+	color: var(--nt-accent-fg);
+	text-decoration: none;
+	font-weight: 600;
+}
+
+.nt-button--ghost {
+	background: transparent;
+	color: var(--nt-fg);
+	border: 1px solid var(--nt-border);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		transition-duration: 0.01ms !important;
+	}
+}

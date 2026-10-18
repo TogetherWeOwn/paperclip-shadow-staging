@@ -1,0 +1,31 @@
+[package]
+name = "nntune-api"
+version = "0.1.0"
+edition = "2021"
+description = "NNTune v2 accounts/auth (passkey challenges + email magic link), sessions, BYOP credential vault (Cloudflare Worker, Rust; native + wasm32)"
+license = "MIT"
+
+[lib]
+name = "nntune_api"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aes-gcm = { version = "0.10", features = ["aes"] }
+# Shared unpadded-base64url over this crate (F-HARD-01): one audited
+# implementation for vault/auth/session. Pure Rust, wasm32-compatible.
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+# wasm32-unknown-unknown has no OS RNG: the `js` feature routes getrandom
+# through Web Crypto on wasm targets (native builds unaffected). Without
+# this the Worker deploy target does not build.
+getrandom = { version = "0.2", features = ["js"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = { version = "1", features = ["derive"] }
+url = "2"
+subtle = "2"
+
+[dev-dependencies]
+serde_json = "1"

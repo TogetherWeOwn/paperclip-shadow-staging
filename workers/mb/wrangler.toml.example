@@ -1,0 +1,18 @@
+# Example binding map for workers/mb. Copy to wrangler.toml locally;
+# never commit real ids or secrets (see repo root .gitignore).
+name = "nntune-mb"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+# [[hyperdrive]]
+# binding = "MB_DB"
+# id = "<HYPERDRIVE_ID_FOR_nntunev2-mb>"
+# localConnectionString = "<postgres://... (local dev only, never commit)>"
+
+# [[kv_namespaces]]
+# binding = "MB_CACHE"
+# id = "<KV_NAMESPACE_ID>"
+
+# [[r2_buckets]]
+# binding = "ART_CACHE"
+# bucket_name = "nntunev2-art"

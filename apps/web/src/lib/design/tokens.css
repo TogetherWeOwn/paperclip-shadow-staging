@@ -1,0 +1,42 @@
+/* NNTune design tokens (v1). Single source of truth for color, type, space. */
+
+:root {
+	color-scheme: light dark;
+
+	--nt-bg: #0b0d12;
+	--nt-bg-raised: #141824;
+	--nt-fg: #f2f4f8;
+	--nt-fg-muted: #a7b0c2;
+	--nt-accent: #7c9aff;
+	--nt-accent-fg: #0b0d12;
+	--nt-border: #2a3247;
+	--nt-good: #57d98d;
+	--nt-bad: #ff7a7a;
+
+	--nt-font: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+	--nt-font-size-base: 1rem;
+	--nt-line: 1.6;
+
+	--nt-space-1: 0.25rem;
+	--nt-space-2: 0.5rem;
+	--nt-space-3: 1rem;
+	--nt-space-4: 1.5rem;
+	--nt-space-5: 2.5rem;
+
+	--nt-radius: 0.75rem;
+	--nt-max-width: 60rem;
+}
+
+@media (prefers-color-scheme: light) {
+	:root {
+		--nt-bg: #f7f8fb;
+		--nt-bg-raised: #ffffff;
+		--nt-fg: #141824;
+		--nt-fg-muted: #4d5670;
+		--nt-accent: #2f4fe0;
+		--nt-accent-fg: #ffffff;
+		--nt-border: #dfe3ee;
+		--nt-good: #1a7f45;
+		--nt-bad: #c0262d;
+	}
+}
