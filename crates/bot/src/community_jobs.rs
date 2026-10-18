@@ -1,0 +1,504 @@
+//! Runtime adapters for the three community jobs (docs/community-jobs.md):
+//! the hourly presence probe, the Monday 06:15 UTC community scorecard tick,
+//! and the hourly inactivity sweep. Registration honors the legacy env gates:
+//! `TWO_PRESENCE_PROBE` on unless `0`, `TWO_COMMUNITY_SCORECARD` off unless `1`,
+//! `TWO_INACTIVITY_DAYS` defaulting to 14. A gated-off or misconfigured job
+//! produces no [`Job`]; its name comes back parked for the readyz status map
+//! and it writes nothing.
+//!
+//! The scorecard reserves up to three attempts, five minutes apart, inside
+//! Monday's window. Reservations and completion live beside the scorecard
+//! runs in Postgres, so restarting cannot reset the budget. Inactivity is
+//! read-only by construction: its outcome carries no channel/message/DM field.
+//!
+//! These jobs are outside the live-identity capability fence on purpose
+//! (TOG-15758): none writes to Discord, so there is no capability to narrow. The
+//! presence probe only reads, the scorecard and the sweep touch Postgres alone,
+//! and `community_jobs_have_no_discord_write_path` fails if that changes.
+//!
+//! The presence probe holds a per-process overlap lease (TOG-12142): a
+//! concurrent trigger skips with `presence_probe_overlap_skipped` instead of
+//! duplicating the daily roster scan, and a holder older than
+//! `PRESENCE_PROBE_LEASE_MS` is presumed dead and taken over.
+
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use sqlx::PgPool;
+use tokio::sync::Mutex;
+use two_bot_core::community_store::{
+    mark_stream_coverage, run_closed_week, CommunityStoreError, ScorecardLoad,
+};
+use two_bot_core::{
+    bot_floor_due, decide_probe_cycle, decide_probe_lease, format_iso_millis, inactivity_store,
+    now_iso, parse_inactivity_days, parse_iso_millis, presence_store, previous_closed_week,
+    release_probe_lease, sanitize_presence_count, scorecard_tick, ClassifierConfig, ProbeLease,
+    ProbeLeaseDecision, ScorecardGates, BOT_FLOOR_MAX_AGE_MS, CAPTURED_STREAMS,
+    INACTIVITY_SWEEP_INTERVAL_MS, PRESENCE_PROBE_INTERVAL_MS, PRESENCE_PROBE_LEASE_MS,
+    SCORECARD_TICK_INTERVAL_MS,
+};
+use two_bot_discord::executor::ActionExecutor;
+
+use crate::{
+    jobs::{self, ErrorClass, Job},
+    website_jobs::{bot_floor_scan, get, Context},
+};
+
+pub const NAMES: [&str; 3] = ["presence_probe", "community_scorecard", "inactivity"];
+
+#[path = "community_scorecard_retry.rs"]
+mod scorecard_retry;
+
+#[cfg(test)]
+#[path = "community_jobs_tests.rs"]
+mod tests;
+
+#[derive(Clone, Copy)]
+pub(crate) enum Kind {
+    PresenceProbe,
+    Scorecard,
+    Inactivity,
+}
+
+/// Cadences are fixed in the deployed binary; time-controlled tests drive
+/// [`run_once`] with an injected `now_ms` instead of the supervisor clock.
+fn cadence(kind: Kind) -> Duration {
+    Duration::from_millis(match kind {
+        Kind::PresenceProbe => PRESENCE_PROBE_INTERVAL_MS,
+        Kind::Scorecard => SCORECARD_TICK_INTERVAL_MS,
+        Kind::Inactivity => INACTIVITY_SWEEP_INTERVAL_MS,
+    })
+}
+
+/// Process-fixed job state, resolved once at registration so a mid-run env
+/// edit cannot split a week's behavior.
+pub(crate) struct State {
+    /// Fact-capture start, stamped at registration (legacy `captureStartedAt`).
+    /// A process that booted mid-week honestly reports partial coverage, which
+    /// is what makes a mid-week start fail closed with `INGESTION_INCOMPLETE`.
+    capture_started_at: String,
+    classifier_version: String,
+    /// Scorecard gates; unreachable when the scorecard job is parked.
+    gates: ScorecardGates,
+    /// `TWO_INACTIVITY_DAYS`; unreachable when the inactivity job is parked.
+    inactivity_days: u64,
+    /// Held across a scorecard attempt; cancellation drops the guard. Durable
+    /// budget/backoff/completion are stored in `community_scorecard_attempts`.
+    scorecard_lane: Mutex<()>,
+    /// Probe overlap lease (TOG-12142): `started_at_ms` of the in-flight
+    /// cycle, cleared when the cycle finishes. A restart starts unleased, so a
+    /// dead process can never block the next tick past one lease period.
+    probe_lease: Mutex<ProbeLease>,
+}
+
+/// A job the env gates refuse to register.
+pub(crate) struct Parked {
+    pub name: &'static str,
+    /// Fixed identifier only: "disabled" for a gate, "invalid_config" for a
+    /// value that failed to parse. Never the raw env value.
+    pub reason: &'static str,
+}
+
+/// Resolved env gates, one decision per job.
+struct Gates {
+    presence: bool,
+    scorecard: Option<ScorecardGates>,
+    inactivity_days: Option<u64>,
+}
+
+fn resolve_gates(vars: &HashMap<String, String>) -> (Gates, Vec<Parked>) {
+    let mut parked = Vec::new();
+    let presence = vars.get("TWO_PRESENCE_PROBE").is_none_or(|v| v != "0");
+    if !presence {
+        parked.push(Parked {
+            name: "presence_probe",
+            reason: "disabled",
+        });
+    }
+    let scorecard = match ScorecardGates::from_map(vars) {
+        Ok(gates) if gates.enabled => Some(gates),
+        Ok(_) => {
+            parked.push(Parked {
+                name: "community_scorecard",
+                reason: "disabled",
+            });
+            None
+        }
+        Err(_) => {
+            parked.push(Parked {
+                name: "community_scorecard",
+                reason: "invalid_config",
+            });
+            None
+        }
+    };
+    let inactivity_days =
+        match parse_inactivity_days(vars.get("TWO_INACTIVITY_DAYS").map(String::as_str)) {
+            Ok(days) => Some(days),
+            Err(_) => {
+                parked.push(Parked {
+                    name: "inactivity",
+                    reason: "invalid_config",
+                });
+                None
+            }
+        };
+    (
+        Gates {
+            presence,
+            scorecard,
+            inactivity_days,
+        },
+        parked,
+    )
+}
+
+/// What registration produced: supervised jobs plus the gated names the caller
+/// must mark parked in the readyz status map.
+pub(crate) struct Registration {
+    pub jobs: Vec<Job>,
+    pub parked: Vec<&'static str>,
+}
+
+/// Read the env gates once and build the supervised jobs.
+pub(crate) fn register(context: Arc<Context>) -> Registration {
+    let (gates, parked) = resolve_gates(&std::env::vars().collect());
+    let mut parked_names = Vec::with_capacity(parked.len());
+    for Parked { name, reason } in parked {
+        match reason {
+            "invalid_config" => {
+                tracing::warn!(job = name, reason, "job_disabled");
+            }
+            _ => {
+                tracing::info!(job = name, reason, "job_disabled");
+            }
+        }
+        parked_names.push(name);
+    }
+    let state = Arc::new(State {
+        capture_started_at: now_iso(),
+        classifier_version: ClassifierConfig::from_env().version,
+        // Parked jobs never read these; the fallbacks are unreachable.
+        gates: gates.scorecard.unwrap_or(ScorecardGates {
+            enabled: false,
+            recommendations_enabled: false,
+            correction_cycles: 0,
+        }),
+        inactivity_days: gates.inactivity_days.unwrap_or(0),
+        scorecard_lane: Mutex::new(()),
+        probe_lease: Mutex::new(None),
+    });
+    let mut out = Vec::new();
+    for (name, kind, enabled) in [
+        ("presence_probe", Kind::PresenceProbe, gates.presence),
+        (
+            "community_scorecard",
+            Kind::Scorecard,
+            gates.scorecard.is_some(),
+        ),
+        (
+            "inactivity",
+            Kind::Inactivity,
+            gates.inactivity_days.is_some(),
+        ),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let context = context.clone();
+        let state = state.clone();
+        let cadence = cadence(kind);
+        out.push(Job {
+            name,
+            cadence,
+            startup_jitter: jobs::startup_jitter(cadence, rand::random()),
+            timeout: Duration::from_secs(120),
+            action: Arc::new(move || {
+                let context = context.clone();
+                let state = state.clone();
+                Box::pin(async move {
+                    run_once(
+                        kind,
+                        context.pool().await?,
+                        &context.rest,
+                        &context.guild,
+                        &state,
+                        now_ms(),
+                    )
+                    .await
+                })
+            }),
+        });
+    }
+    Registration {
+        jobs: out,
+        parked: parked_names,
+    }
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+/// One supervised attempt with the clock injected. Each job holds its own
+/// lane: none of the three shares the website denominator lock.
+pub(crate) async fn run_once(
+    kind: Kind,
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    state: &State,
+    now_ms: i64,
+) -> Result<(), ErrorClass> {
+    match kind {
+        Kind::PresenceProbe => presence_tick(pool, rest, guild, state, now_ms).await,
+        Kind::Scorecard => scorecard_once(pool, guild, state, now_ms).await,
+        Kind::Inactivity => inactivity_tick(pool, state, now_ms).await,
+    }
+}
+
+/// One probe cycle (legacy `runProbeCycle`). A transport failure is a failed
+/// attempt; an unusable count is a successful attempt that writes nothing —
+/// the series reads as "the times we successfully looked". A failed member
+/// listing keeps the presence row with a NULL floor rather than losing the
+/// cycle.
+async fn presence_tick(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    state: &State,
+    now_ms: i64,
+) -> Result<(), ErrorClass> {
+    // Overlap guard (TOG-12142): decide and claim under one lock acquisition,
+    // so two triggers can never both see a free lease, and skip before any
+    // REST call, so a slow cycle cannot duplicate the daily roster scan. A
+    // stale holder is taken over on the spot.
+    {
+        let mut lease = state.probe_lease.lock().await;
+        match decide_probe_lease(*lease, now_ms, PRESENCE_PROBE_LEASE_MS) {
+            ProbeLeaseDecision::Skip => {
+                tracing::warn!(job = "presence_probe", "presence_probe_overlap_skipped");
+                return Ok(());
+            }
+            ProbeLeaseDecision::Takeover => {
+                tracing::warn!(job = "presence_probe", "presence_probe_lease_takeover");
+            }
+            ProbeLeaseDecision::Run => {}
+        }
+        *lease = Some(now_ms);
+    }
+    let outcome = presence_tick_inner(pool, rest, guild, now_ms).await;
+    // Success or failure, release only this cycle's own claim. A cancelled
+    // cycle (supervisor timeout) never gets here; its lease goes stale and the
+    // next tick takes it over.
+    let mut lease = state.probe_lease.lock().await;
+    *lease = release_probe_lease(*lease, now_ms);
+    outcome
+}
+
+async fn presence_tick_inner(
+    pool: &PgPool,
+    rest: &ActionExecutor,
+    guild: &str,
+    now_ms: i64,
+) -> Result<(), ErrorClass> {
+    let counts = get(rest, &format!("/guilds/{guild}?with_counts=true")).await?;
+    // Sanitize before the roster read: a missing/negative count is a failed
+    // read and consumes no bot-floor listing budget.
+    let presence = sanitize_presence_count(counts["approximate_presence_count"].as_i64());
+    if presence.is_none() {
+        // Return before the roster read: a failed presence write consumes no
+        // bot-floor listing budget.
+        tracing::warn!(job = "presence_probe", "presence_probe_read_failed");
+        return Ok(());
+    }
+    let last_floor_ms = presence_store::last_bot_floor_at(pool, guild)
+        .await
+        .map_err(|_| ErrorClass::Database)?
+        .and_then(|at| parse_iso_millis(&at));
+    let fresh_floor = if bot_floor_due(last_floor_ms, now_ms, BOT_FLOOR_MAX_AGE_MS) {
+        match bot_floor_scan(rest, guild).await {
+            Ok(scan) => Some(scan),
+            Err(_) => {
+                tracing::warn!(job = "presence_probe", "presence_probe_bot_floor_failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let decision = decide_probe_cycle(presence, last_floor_ms, fresh_floor, now_ms);
+    let recorded =
+        presence_store::record_reading(pool, guild, decision, &format_iso_millis(now_ms))
+            .await
+            .map_err(|_| ErrorClass::Database)?;
+    if recorded {
+        tracing::info!(job = "presence_probe", "presence_probe_recorded");
+    }
+    Ok(())
+}
+
+/// Serialize reservations across processes and commit before coverage/scoring.
+/// A failed reservation starts no work. A lost commit acknowledgement can waste
+/// a slot, but cannot grant an extra one after restart.
+async fn reserve_attempt(
+    pool: &PgPool,
+    guild: &str,
+    now_ms: i64,
+) -> Result<Option<String>, sqlx::Error> {
+    let Some(week_key) = scorecard_tick(now_ms, None) else {
+        return Ok(None);
+    };
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO community_scorecard_attempts (guild_id, week_key)
+         VALUES ($1, $2) ON CONFLICT (guild_id, week_key) DO NOTHING",
+    )
+    .bind(guild)
+    .bind(&week_key)
+    .execute(&mut *tx)
+    .await?;
+    let (attempts, next_attempt_at, completed): (i32, i64, bool) = sqlx::query_as(
+        "SELECT attempts, next_attempt_at, completed FROM community_scorecard_attempts
+         WHERE guild_id=$1 AND week_key=$2 FOR UPDATE",
+    )
+    .bind(guild)
+    .bind(&week_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    // A run may have committed before cancellation or a failed completion
+    // write. Reconcile it before retrying, even if the watermark/classifier
+    // changed. An incomplete scorecard is also a successful persisted output.
+    let (_, week_end) = previous_closed_week(now_ms);
+    let published: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM community_scorecard_runs
+         WHERE guild_id=$1 AND week_end=$2)",
+    )
+    .bind(guild)
+    .bind(&week_end)
+    .fetch_one(&mut *tx)
+    .await?;
+    let current = scorecard_retry::AttemptState {
+        week_key: week_key.clone(),
+        attempts,
+        next_attempt_at,
+        completed: completed || published,
+    };
+    let decision = scorecard_retry::decide(&current, now_ms);
+    let (next, claimed) = match decision {
+        scorecard_retry::Decision::Attempt(next) => (next, Some(week_key)),
+        scorecard_retry::Decision::Wait | scorecard_retry::Decision::Skip => (current, None),
+    };
+    sqlx::query(
+        "UPDATE community_scorecard_attempts
+         SET attempts=$3, next_attempt_at=$4, completed=$5
+         WHERE guild_id=$1 AND week_key=$2",
+    )
+    .bind(guild)
+    .bind(&next.week_key)
+    .bind(next.attempts)
+    .bind(next.next_attempt_at)
+    .bind(next.completed)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(claimed)
+}
+
+/// One eligible tick: up to three attempts per Monday, spaced five minutes
+/// apart. Only successful scoring completes the week; failures keep the
+/// durable reservation for the next eligible tick (including after restart).
+async fn scorecard_once(
+    pool: &PgPool,
+    guild: &str,
+    state: &State,
+    now_ms: i64,
+) -> Result<(), ErrorClass> {
+    let Ok(_lane) = state.scorecard_lane.try_lock() else {
+        return Ok(());
+    };
+    let Some(week_key) = reserve_attempt(pool, guild, now_ms)
+        .await
+        .map_err(|_| ErrorClass::Database)?
+    else {
+        return Ok(());
+    };
+    let (week_start, week_end) = previous_closed_week(now_ms);
+    let generated_at = format_iso_millis(now_ms);
+    // A Monday boot captured none of the closed week. Do not insert an
+    // inverted coverage interval or invent coverage: only streams with a live
+    // writer (`CAPTURED_STREAMS`) are marked, and the builder fails closed on
+    // the unmarked remainder while retaining honestly persisted coverage.
+    if state.capture_started_at <= week_end {
+        for stream in CAPTURED_STREAMS {
+            mark_stream_coverage(
+                pool,
+                guild,
+                stream,
+                &state.capture_started_at,
+                &week_end,
+                &generated_at,
+            )
+            .await
+            .map_err(|_| ErrorClass::Database)?;
+        }
+    }
+    let (_json, reused, alert_emitted) = run_closed_week(
+        pool,
+        ScorecardLoad {
+            guild_id: guild.to_owned(),
+            classifier_version: state.classifier_version.clone(),
+            week_start,
+            week_end,
+            watermark: 0,
+            generated_at,
+            recommendations_enabled: state.gates.recommendations_enabled,
+            correction_cycles: state.gates.correction_cycles,
+        },
+    )
+    .await
+    .map_err(|error| match error {
+        CommunityStoreError::Build(_) | CommunityStoreError::UnknownFactType(_) => {
+            ErrorClass::Configuration
+        }
+        CommunityStoreError::Db(_) => ErrorClass::Database,
+    })?;
+    sqlx::query(
+        "UPDATE community_scorecard_attempts SET completed=TRUE
+         WHERE guild_id=$1 AND week_key=$2",
+    )
+    .bind(guild)
+    .bind(&week_key)
+    .execute(pool)
+    .await
+    .map_err(|_| ErrorClass::Database)?;
+    tracing::info!(
+        job = "community_scorecard",
+        week = week_key,
+        reused,
+        alert_emitted,
+        "community_scorecard_completed"
+    );
+    Ok(())
+}
+
+/// One quiet-member sweep (legacy `flagInactive`). Read-only: the outcome
+/// carries no channel/message/DM field, so it cannot feed a send path.
+async fn inactivity_tick(pool: &PgPool, state: &State, now_ms: i64) -> Result<(), ErrorClass> {
+    let outcome =
+        inactivity_store::run_sweep(pool, &format_iso_millis(now_ms), state.inactivity_days)
+            .await
+            .map_err(|_| ErrorClass::Database)?;
+    tracing::info!(
+        job = "inactivity",
+        days = state.inactivity_days,
+        flagged = outcome.flagged.len(),
+        "inactivity_scan"
+    );
+    Ok(())
+}

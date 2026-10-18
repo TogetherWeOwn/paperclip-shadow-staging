@@ -1,0 +1,82 @@
+# Dependabot policy for two-bot-next.
+#
+# Why grouped weekly: CI runner capacity is the bottleneck, and one grouped
+# PR per ecosystem per week replaces up to N single-bump PRs. Security
+# updates are NOT grouped (applies-to: version-updates on every group), so
+# they keep arriving as separate, prioritized PRs.
+#
+# Deliberately not covered:
+#   Workflow service/job-container images (postgres, rust): the `docker`
+#   ecosystem reads Dockerfiles only. They are digest-pinned and bumped by
+#   hand; see the note above `jobs:` in .github/workflows/check.yml.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+    commit-message: { prefix: "chore(deps)" }
+    labels: ["dependencies"]
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      cargo-major:
+        applies-to: version-updates
+        update-types: [major]
+  # The separate `cargo-fuzz` workspace (`exclude = ["fuzz"]`,
+  # `publish = false`) gained a required compile gate (`fuzz-compile` in
+  # check.yml) and a committed `fuzz/Cargo.lock` seeded from the root
+  # lockfile, so bump PRs here are verifiable: the gate builds them locked.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+    commit-message: { prefix: "chore(deps)" }
+    labels: ["dependencies"]
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      cargo-major:
+        applies-to: version-updates
+        update-types: [major]
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+    commit-message: { prefix: "build(deps)" }
+    labels: ["dependencies"]
+    open-pull-requests-limit: 5
+    groups:
+      docker-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      docker-major:
+        applies-to: version-updates
+        update-types: [major]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+    commit-message: { prefix: "ci(deps)" }
+    labels: ["dependencies"]
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      actions-major:
+        applies-to: version-updates
+        update-types: [major]
+  - package-ecosystem: npm
+    directory: /wrangler
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: UTC }
+    commit-message: { prefix: "chore(deps)" }
+    labels: ["dependencies"]
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+      npm-major:
+        applies-to: version-updates
+        update-types: [major]

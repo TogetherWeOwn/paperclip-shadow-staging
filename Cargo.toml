@@ -1,0 +1,145 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store", "crates/testsupport"]
+exclude = ["fuzz"]
+default-members = [".", "crates/core", "crates/discord", "crates/bot", "crates/cutover", "crates/store"]
+
+# One native Rust release strategy versions the whole workspace. The root
+# library exposes release metadata; it is not a crates.io distribution.
+[package]
+name = "two-bot-next"
+version = "0.4.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Library/runtime modules must use structured tracing, not stdout/debug macros.
+# Only operator CLI modules locally allow print_stdout; dbg_macro stays denied.
+[lints]
+workspace = true
+
+[workspace.lints.clippy]
+print_stdout = "deny"
+dbg_macro = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.94"
+license = "BUSL-1.1"
+
+# Pinned versions for the dependency tree (see Cargo.lock). Kept in one place
+# so S3+ slices bump consistently. sqlx 0.9 sets the MSRV floor (>= 1.94).
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+    "tracing",
+] }
+base64 = "0.23"
+bytes = "1"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+hex = "0.4"
+hmac = "0.13"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "http1",
+    "ring",
+    "webpki-roots",
+] }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "tokio",
+    "client-legacy",
+    "http1",
+] }
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+# preserve_order: serde_json maps keep insertion order (IndexMap) instead of
+# sorting keys. Funnel metadata blobs must match legacy JSON.stringify byte
+# order (startKnown, startedAt, durationSeconds) — Postgres TEXT comparison
+# is byte-wise, and S6 persists these blobs as TEXT. indexmap is already in
+# the locked tree, so this enables no new crates.
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
+subtle = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+# `macros` gates the `mod macros` module that holds `migrate!`
+# (sqlx 0.9: `mod macros` is `#[cfg(feature = "macros")]`, so `migrate`
+# alone does not export the macro). TOG-9882 cutover migrations embed via
+# `sqlx::migrate!`.
+sqlx = { version = "0.9", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls-ring-webpki",
+    "macros",
+    "migrate",
+    "json",
+    "time",
+] }
+# Unicode link patterns and WHATWG host parsing preserve legacy automod semantics.
+regex = "1"
+url = "2"
+# NFKC normalization for the automod bad-word matcher.
+unicode-normalization = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+    "process",
+] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+# hyper-util's DNS-pinned connector impls `tower_service::Service<Name>`;
+# already in the lockfile transitively (MIT, deny.toml-allowed).
+tower-service = "0.3"
+tower-http = { version = "0.7", default-features = false, features = ["trace"] }
+tracing = "0.1"
+# `log` records bridged by tracing-subscriber's default `tracing-log` feature
+# carry a synthetic `log` target; the JSON formatter normalizes it back.
+# Already in the lockfile transitively (MIT, deny.toml-allowed).
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# S2 prototype only (dev-dependency of two-bot-discord): mock Discord gateway
+# double. Same WS stack twilight-gateway itself uses; `server` for the mock
+# listener, `sha1_smol` (BSD-3-Clause, allowed in deny.toml) for the handshake.
+futures-util = "0.3"
+# Sole rustls crypto provider (ring): twilight's `rustls-platform-verifier`
+# stack builds its TLS connector at client/shard construction (even for
+# plain-ws/plain-HTTP targets like the mock), and rustls panics without
+# exactly one provider feature. `ring` needs only perl+cc (present on CI
+# ubuntu runners). S3 also declares this on the bot crate so the release
+# binary shares the same provider (`ensure_crypto_provider`, TOG-9808).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-websockets = { version = "0.13", default-features = false, features = [
+    "server",
+    "sha1_smol",
+] }
+twilight-cache-inmemory = { version = "0.17", default-features = false }
+twilight-gateway = { version = "0.17", default-features = false, features = [
+    "rustls-platform-verifier",
+    "zlib",
+] }
+twilight-http = { version = "0.17", default-features = false, features = [
+    "rustls-platform-verifier",
+] }
+twilight-model = "0.17"
+
+[profile.release]
+# lite Container headroom (256 MiB): favour size over last-percent speed.
+opt-level = "z"
+lto = true
+codegen-units = 1
+# Router handlers and supervised jobs must unwind to isolate panics in release.
+panic = "unwind"
+strip = true
