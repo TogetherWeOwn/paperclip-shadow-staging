@@ -1,0 +1,285 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::*;
+use crate::metrics;
+use sqlx::{PgPool, Row};
+
+/// Every consumer of a credential must use the same authoritative database.
+/// Fully qualified table names prevent search_path from splitting a token lane.
+#[derive(Clone, Debug)]
+pub struct PgSendAdmission {
+    pool: PgPool,
+    key: TokenKey,
+}
+
+impl PgSendAdmission {
+    pub fn new(pool: PgPool, token: &str) -> Result<Self, AdmissionError> {
+        Ok(Self {
+            pool,
+            key: TokenKey::for_bot_token(token)?,
+        })
+    }
+
+    /// Monotonic external extension; never clears an occupied/indefinite lane.
+    pub async fn extend(&self, cooldown: SendCooldown) -> Result<(), AdmissionError> {
+        let delay = finite_delay(Some(cooldown));
+        sqlx::query(
+            "INSERT INTO public.discord_send_admission (token_key, indefinite, hold_until_ms) \
+             VALUES ($1, $2, CASE WHEN $3::bigint IS NULL THEN 0 ELSE \
+               (extract(epoch FROM clock_timestamp()) * 1000)::bigint + $3 END) \
+             ON CONFLICT (token_key) DO UPDATE SET \
+               indefinite = discord_send_admission.indefinite OR EXCLUDED.indefinite, \
+               hold_until_ms = GREATEST(discord_send_admission.hold_until_ms, EXCLUDED.hold_until_ms)",
+        )
+        .bind(&self.key.0)
+        .bind(delay.is_none())
+        .bind(delay)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| {
+            metrics::global().db_error("admission");
+            AdmissionError::Storage
+        })?;
+        Ok(())
+    }
+}
+
+// Reserve space for the DB clock too. Unrepresentable timing becomes an
+// indefinite hold, never a shorter guessed delay or arithmetic wraparound.
+fn finite_delay(cooldown: Option<SendCooldown>) -> Option<i64> {
+    match cooldown {
+        Some(SendCooldown::FiniteMs(ms)) if ms <= i64::MAX as u64 / 2 => Some(ms as i64),
+        _ => None,
+    }
+}
+
+/// A held lane self-heals past this age (database clock, ms). One admitted
+/// attempt holds the lane for a single HTTP exchange (5 s wire plus 5 s body
+/// budgets and receipt validation), and every in-process retry loop is bounded
+/// (5 tries, 5 s each, 500/1000/2000/4000 ms backoffs: under 35 s all-in), so
+/// 60 s can never be consumed by the same process retrying the same intent.
+/// Only a new process past 60 s can reclaim, and those carry new intents,
+/// except the idempotent boot registry PUT and effect-claim-governed resume
+/// paths, which own intent safety at their own layer (nonces, idempotent verbs,
+/// claim fences). Cross-restart resend of an uncertain mutation is therefore
+/// the consciously accepted trade for never wedging boot forever. Indefinite
+/// and finite-cooldown holds never heal: they are deliberate pacing, not dead
+/// holders. Reclaiming bumps the generation, so the dead holder's late
+/// completion lands as `StaleClaim` and cannot release the new holder.
+pub const IN_FLIGHT_LEASE_MS: i64 = 60_000;
+
+/// Postgres `undefined_column`: the build was deployed ahead of its migration
+/// (staging 2026-10-05 ran lease-stamped SQL while the ledger still ended at
+/// 0418, so every boot admission failed and the container never served). The
+/// runtime is DML-only and never self-migrates, so a missing lease column must
+/// degrade to the pre-lease lane, not fail boot; the lease activates on its
+/// own once the migration lands, with no restart-gated cache to invalidate.
+const UNDEFINED_COLUMN: &str = "42703";
+
+fn is_undefined_column(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some(UNDEFINED_COLUMN)
+    )
+}
+
+/// One loud warning per process: every later admit takes the same legacy path.
+static LEGACY_LANE_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_legacy_lane() {
+    if !LEGACY_LANE_WARNED.swap(true, Ordering::SeqCst) {
+        tracing::warn!(
+            "Discord send admission lacks in_flight_since_ms; \
+             lease self-heal disabled until the pending migration lands"
+        );
+    }
+}
+
+impl SendAdmission for PgSendAdmission {
+    fn token_key(&self) -> &TokenKey {
+        &self.key
+    }
+
+    fn admit(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        Box::pin(async move {
+            // One autocommitted statement, not a transaction held over HTTP.
+            // Commit precedes sending. Losing/cancelling this query can only
+            // leave a durable occupied row; it cannot grant another sender.
+            // Each take stamps the database clock so a dead holder's lane is
+            // reclaimable past the lease (second statement below).
+            let row = sqlx::query(
+                "INSERT INTO public.discord_send_admission \
+                   (token_key, in_flight, generation, in_flight_since_ms) \
+                 VALUES ($1, TRUE, 1, \
+                   (extract(epoch FROM clock_timestamp()) * 1000)::bigint) \
+                 ON CONFLICT (token_key) DO UPDATE SET \
+                   in_flight = TRUE, \
+                   generation = discord_send_admission.generation + 1, \
+                   in_flight_since_ms = \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+                 WHERE NOT discord_send_admission.in_flight \
+                   AND NOT discord_send_admission.indefinite \
+                   AND discord_send_admission.hold_until_ms <= \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+                 RETURNING generation",
+            )
+            .bind(&self.key.0)
+            .fetch_optional(&self.pool)
+            .await;
+            let row = match row {
+                Ok(row) => row,
+                Err(error) if is_undefined_column(&error) => {
+                    warn_legacy_lane();
+                    return self.admit_legacy().await;
+                }
+                Err(_) => {
+                    metrics::global().db_error("admission");
+                    metrics::global().send_admission("storage_error");
+                    return Err(AdmissionError::Storage);
+                }
+            };
+            if let Some(row) = row {
+                let generation: i64 = row.try_get("generation").map_err(|_| {
+                    metrics::global().db_error("admission");
+                    metrics::global().send_admission("storage_error");
+                    AdmissionError::Storage
+                })?;
+                metrics::global().send_admission("admitted");
+                return Ok(AdmissionPermit::new(Box::new(PgCompletion {
+                    gate: self.clone(),
+                    generation,
+                })));
+            }
+            // The lane is held. A fresh holder still blocks, but a holder dead
+            // past the lease (crashed process, or a completion lost to a
+            // storage outage) is reclaimed here: the generation bump turns the
+            // dead holder's late completion into `StaleClaim`, and the fresh
+            // stamp gives the new holder its own full lease. The reclaim is
+            // one atomic statement, so racing reclaimers elect exactly one
+            // winner. Indefinite and finite-cooldown holds never reclaim.
+            let row = sqlx::query(
+                "UPDATE public.discord_send_admission SET \
+                   in_flight = TRUE, \
+                   generation = generation + 1, \
+                   in_flight_since_ms = \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+                 WHERE token_key = $1 AND in_flight \
+                   AND NOT indefinite \
+                   AND hold_until_ms <= \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+                   AND in_flight_since_ms <= \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint - $2 \
+                 RETURNING generation",
+            )
+            .bind(&self.key.0)
+            .bind(IN_FLIGHT_LEASE_MS)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| {
+                metrics::global().db_error("admission");
+                metrics::global().send_admission("storage_error");
+                AdmissionError::Storage
+            })?;
+            let Some(row) = row else {
+                metrics::global().send_admission("blocked");
+                return Err(AdmissionError::Blocked);
+            };
+            let generation: i64 = row.try_get("generation").map_err(|_| {
+                metrics::global().db_error("admission");
+                metrics::global().send_admission("storage_error");
+                AdmissionError::Storage
+            })?;
+            tracing::warn!(
+                generation,
+                "Discord send admission reclaimed a stale in-flight lane"
+            );
+            metrics::global().send_admission("admitted");
+            Ok(AdmissionPermit::new(Box::new(PgCompletion {
+                gate: self.clone(),
+                generation,
+            })))
+        })
+    }
+}
+
+impl PgSendAdmission {
+    /// Pre-lease take-or-block: a free lane is taken, a held lane is refused,
+    /// and no reclaim is attempted. Only reached when the lease column is
+    /// absent (build deployed ahead of its migration); behavior matches the
+    /// lane exactly as it was before the lease change.
+    fn admit_legacy(&self) -> AdmissionFuture<'_, Result<AdmissionPermit, AdmissionError>> {
+        Box::pin(async move {
+            let row = sqlx::query(
+                "INSERT INTO public.discord_send_admission (token_key, in_flight, generation) \
+                 VALUES ($1, TRUE, 1) ON CONFLICT (token_key) DO UPDATE SET \
+                   in_flight = TRUE, generation = discord_send_admission.generation + 1 \
+                 WHERE NOT discord_send_admission.in_flight \
+                   AND NOT discord_send_admission.indefinite \
+                   AND discord_send_admission.hold_until_ms <= \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+                 RETURNING generation",
+            )
+            .bind(&self.key.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| {
+                metrics::global().db_error("admission");
+                metrics::global().send_admission("storage_error");
+                AdmissionError::Storage
+            })?;
+            let Some(row) = row else {
+                metrics::global().send_admission("blocked");
+                return Err(AdmissionError::Blocked);
+            };
+            let generation: i64 = row.try_get("generation").map_err(|_| {
+                metrics::global().db_error("admission");
+                metrics::global().send_admission("storage_error");
+                AdmissionError::Storage
+            })?;
+            metrics::global().send_admission("admitted");
+            Ok(AdmissionPermit::new(Box::new(PgCompletion {
+                gate: self.clone(),
+                generation,
+            })))
+        })
+    }
+}
+
+struct PgCompletion {
+    gate: PgSendAdmission,
+    generation: i64,
+}
+
+impl SendCompletion for PgCompletion {
+    fn complete(
+        self: Box<Self>,
+        cooldown: Option<SendCooldown>,
+    ) -> AdmissionFuture<'static, Result<(), AdmissionError>> {
+        Box::pin(async move {
+            let delay = finite_delay(cooldown);
+            let indefinite = cooldown.is_some() && delay.is_none();
+            let updated = sqlx::query(
+                "UPDATE public.discord_send_admission SET \
+                   indefinite = indefinite OR $3, \
+                   hold_until_ms = GREATEST(hold_until_ms, CASE WHEN $4::bigint IS NULL THEN 0 ELSE \
+                     (extract(epoch FROM clock_timestamp()) * 1000)::bigint + $4 END), \
+                   in_flight = FALSE \
+                 WHERE token_key = $1 AND generation = $2 AND in_flight",
+            )
+            .bind(&self.gate.key.0)
+            .bind(self.generation)
+            .bind(indefinite)
+            .bind(delay)
+            .execute(&self.gate.pool)
+            .await
+            .map_err(|_| {
+                metrics::global().db_error("admission");
+                AdmissionError::Storage
+            })?;
+            if updated.rows_affected() != 1 {
+                return Err(AdmissionError::StaleClaim);
+            }
+            Ok(())
+        })
+    }
+}
