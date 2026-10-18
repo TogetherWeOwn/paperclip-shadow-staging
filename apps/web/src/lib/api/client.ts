@@ -8,6 +8,8 @@
  * sites, because all requests flow through {@link ApiClient}.
  */
 
+import type { ProviderForm } from '../vault-validation.js';
+
 export type FetchFn = typeof fetch;
 
 export interface ApiClientOptions {
@@ -25,6 +27,54 @@ export class ApiError extends Error {
 		this.status = status;
 		this.code = code;
 	}
+}
+
+export interface MagicLinkResult {
+	ok: true;
+}
+
+export interface IndexerConfigInput {
+	url: string;
+	api_key: string;
+}
+
+/** Wire shape used by workers/api's serde ProviderConfig and IndexerConfig. */
+export interface ProviderTestInput {
+	host: string;
+	port: number;
+	tls: boolean;
+	allow_insecure_plaintext: boolean;
+	username: string;
+	password: string;
+	max_connections: number;
+	indexer?: IndexerConfigInput;
+}
+
+export function toProviderTestInput(
+	provider: ProviderForm,
+	indexerUrl: string,
+	indexerApiKey: string
+): ProviderTestInput {
+	return {
+		host: provider.host.trim(),
+		port: provider.port,
+		tls: provider.tls,
+		// Only send the opt-in with plaintext: with TLS it is always false so
+		// the server never records a spurious acknowledgement.
+		allow_insecure_plaintext: !provider.tls && provider.allowInsecurePlaintext,
+		username: provider.username,
+		password: provider.password,
+		max_connections: provider.maxConnections,
+		...(indexerUrl.trim().length > 0
+			? { indexer: { url: indexerUrl.trim(), api_key: indexerApiKey } }
+			: {})
+	};
+}
+
+export interface ProviderTestResult {
+	ok: boolean;
+	latencyMs?: number;
+	error?: string;
 }
 
 export class ApiClient {
@@ -48,11 +98,52 @@ export class ApiClient {
 		return this.request<T>(path, { method: 'GET' });
 	}
 
+	async post<T>(path: string, body: unknown): Promise<T> {
+		return this.request<T>(path, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+	}
+
+	/**
+	 * Request an email magic link. Always resolves the same way for unknown
+	 * and known addresses (the API never reveals which emails exist).
+	 */
+	async requestMagicLink(email: string): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>('/v1/auth/magic-link', { email });
+	}
+
+	/**
+	 * Live-test a provider (+ optional indexer) config without storing it.
+	 * The API validates (SSRF guard), dials, and returns a redacted result —
+	 * secrets never come back in the response.
+	 */
+	async testProviderConnection(input: ProviderTestInput): Promise<ProviderTestResult> {
+		return this.post<ProviderTestResult>('/v1/vault/test', input);
+	}
+
+	/**
+	 * Store a tested provider (+ optional indexer) config in the encrypted
+	 * vault. The API seals secrets with envelope encryption; responses are
+	 * redacted summaries, never secret material.
+	 */
+	async saveProviderConfig(input: ProviderTestInput): Promise<MagicLinkResult> {
+		return this.post<MagicLinkResult>('/v1/vault', input);
+	}
+
 	private async request<T>(path: string, init: RequestInit): Promise<T> {
-		const headers: Record<string, string> = { accept: 'application/json' };
+		const headers: Record<string, string> = {
+			...((init.headers as Record<string, string> | undefined) ?? {}),
+			accept: 'application/json'
+		};
 		if (this.token !== null) headers['authorization'] = `Bearer ${this.token}`;
 
-		const response = await this.fetchFn(`${this.baseUrl}${path}`, { ...init, headers });
+		const response = await this.fetchFn(`${this.baseUrl}${path}`, {
+			...init,
+			headers,
+			credentials: 'include'
+		});
 		if (!response.ok) {
 			throw new ApiError(response.status, this.errorCode(response.status), await this.message(response));
 		}

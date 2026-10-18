@@ -103,6 +103,9 @@ HOST_FIXTURE_EXCLUSIONS = frozenset(
         # SSRF negative-test vectors: reserved ranges asserted rejected.
         "workers/api/tests/api_tests.rs",
         "workers/api/tests/security_regressions.rs",
+        # SSRF negative-test vectors (web vault validation): private IPv4
+        # and metadata IP asserted rejected client-side.
+        "apps/web/src/lib/vault-validation.test.ts",
     }
 )
 
