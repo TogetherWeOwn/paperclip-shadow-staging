@@ -1,0 +1,198 @@
+# two-bot-next deploy skeleton (S1): one always-on Container behind a
+# Worker + Durable Object wrapper (ADR 0001: `lite` target, DO-alarm keepalive).
+#
+# Secrets (DISCORD_TOKEN, DATABASE_URL) are set as Worker secrets and passed
+# into the container as env vars — never baked into the image:
+#   wrangler secret put DISCORD_TOKEN
+#   wrangler secret put DATABASE_URL
+
+name = "two-bot-next"
+main = "src/index.ts"
+compatibility_date = "2026-09-29"
+# nodejs_compat lets node-postgres reach Hyperdrive when the optional
+# REDIRECT_DB binding exists (redirect-db.ts, TOG-12194). The second flag
+# keeps secrets and vars out of process.env: bindings stay reachable only
+# through `env`, as they were before nodejs_compat. Inherited by every [env.*].
+compatibility_flags = ["nodejs_compat", "nodejs_compat_do_not_populate_process_env"]
+
+# Identity is supplied by Cloudflare, not a hand-edited env flag. Ownership
+# must be explicitly transferred after each new version is deployed.
+[version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# Default-environment bindings. Named environments do NOT inherit these —
+# every [env.*] below repeats the full Container/DO wiring explicitly.
+# Verified against wrangler 4.147.0 (`deploy --dry-run --env <name>` warns on
+# any omission); enforced in CI by scripts/check-env-bindings.py.
+[[containers]]
+class_name = "TwoBotContainer"
+image = "../Dockerfile"
+# ADR 0001: target `lite`; escalate to `basic` only if measured RSS > ~200 MiB.
+instance_type = "lite"
+max_instances = 1
+
+# Pin the singleton container to US jurisdiction (production database lives in
+# AWS us-east-1): nearest-request routing would otherwise place it anywhere.
+[containers.constraints]
+regions = ["ENAM"]
+jurisdiction = "us"
+
+[[durable_objects.bindings]]
+name = "TWO_BOT"
+class_name = "TwoBotContainer"
+
+[exports.TwoBotContainer]
+type = "durable-object"
+storage = "sqlite"
+
+[vars]
+# B3 (TOG-9696): go.two.gg redirect source. The optional Hyperdrive binding
+# `REDIRECT_DB` (TOG-12194) is created by the Operator, not declared here yet;
+# without it REDIRECT_MAPPINGS_JSON carries a snapshot of the invite_campaigns
+# rows (same shape, see redirect-store.ts) and clicks are dropped.
+# REDIRECT_FALLBACK_CODE is the invite code for `/` and DB outages.
+REDIRECT_FALLBACK_CODE = ""
+REDIRECT_MAPPINGS_JSON = "[]"
+# Worker-only paging switch: installing a webhook secret alone never sends.
+# Vars are non-inheritable, so every environment explicitly defaults to off.
+OPS_ALERT_FORWARDING = "off"
+# Container HTTP port (must match the Rust LISTEN_ADDR port).
+BOT_PORT = "8080"
+# Keepalive tick: the DO schedule() below re-arms itself this often; each
+# tick renews the activity timeout so the gateway WebSocket (outbound-only,
+# invisible to Container idle billing) never lets the instance sleep.
+KEEPALIVE_SECONDS = "60"
+
+# Named environments repeat the full Container/DO/vars wiring: Wrangler
+# bindings are non-inheritable, so an [env.*] with only `vars` deploys a
+# Worker whose env.TWO_BOT is undefined (staging HTTP 1101, TOG-9907).
+# Staging deploys automatically via deploy-staging.yml; production deploys are
+# manual and owned by B4 (TOG-9699): only the dispatch-only deploy-production.yml,
+# behind the `production` GitHub Environment (docs/production-deploy.md).
+# Secrets per environment (never here):
+#   wrangler secret put --env staging DISCORD_TOKEN      # staging bot token
+#   wrangler secret put --env staging GUILD_ID           # TWO Staging guild
+#   wrangler secret put --env production DISCORD_TOKEN   # B4 only
+[env.staging.version_metadata]
+binding = "CF_VERSION_METADATA"
+
+[[env.staging.containers]]
+class_name = "TwoBotContainer"
+image = "../Dockerfile"
+# ADR 0001: target `lite`; escalate to `basic` only if measured RSS > ~200 MiB.
+instance_type = "lite"
+max_instances = 1
+
+[env.staging.containers.constraints]
+regions = ["ENAM"]
+jurisdiction = "us"
+
+[[env.staging.durable_objects.bindings]]
+name = "TWO_BOT"
+class_name = "TwoBotContainer"
+
+[env.staging.exports.TwoBotContainer]
+type = "durable-object"
+storage = "sqlite"
+
+[env.staging.vars]
+# B3 (TOG-9696) redirect snapshot: same empty placeholder as top level until
+# S1 lands the shared DB (vars are not inherited, so this must be repeated).
+REDIRECT_FALLBACK_CODE = ""
+REDIRECT_MAPPINGS_JSON = "[]"
+# Worker-only paging switch: installing a webhook secret alone never sends.
+# Vars are non-inheritable, so every environment explicitly defaults to off.
+OPS_ALERT_FORWARDING = "off"
+# Container HTTP port (must match the Rust LISTEN_ADDR port).
+BOT_PORT = "8080"
+# Keepalive tick: renews the activity timeout so the gateway WebSocket
+# (outbound-only, invisible to Container idle billing) never sleeps.
+KEEPALIVE_SECONDS = "60"
+TWO_GUILD_NAME = "TWO Staging"
+# TOG-12980: staging-only, default-dark Worker ingress for POST /internal/actions
+# (the private receiver, docs/internal-actions-receiver.md). The route stays 404
+# until the Operator also sets the Worker secret TWO_INTERNAL_ACTIONS=1, last.
+# Never top-level (top-level vars are required in every environment) and never
+# in the production vars table: scripts/check-env-bindings.py fails either.
+INTERNAL_ACTIONS_INGRESS = "1"
+# Staging-only automation gates: publish + serve automation and announcement
+# command surfaces in the staging guild only. Never top-level and never
+# production. Forwarded into the container via FORWARDED_FLAGS
+# (wrangler/src/container-env.ts); the feed poller idles with no feeds
+# configured. Rollback is unset + re-publish (PUT is a full replacement).
+TWO_AUTOMATIONS = "1"
+TWO_ANNOUNCEMENTS = "1"
+# Staging-only boot publication (docs/command-publish.md): at startup the
+# container fetches the staging guild's command registry, compares hashes and
+# sends one full replacement only when they differ. It uses the container's own
+# send-admission database, so no operator database credential is needed. The
+# application ID is the staging bot's public ID. The live-guild fence stays on
+# (TWO_COMMANDS_ALLOW_LIVE_GUILD is never set), so a live GUILD_ID refuses.
+# Never top-level and never production. Rollback: delete both lines, redeploy.
+TWO_COMMANDS_PUBLISH_ON_BOOT = "1"
+DISCORD_APPLICATION_ID = "1469137636663758888"
+# Staging-only temporary voice gate (docs/voice-cutover-rehearsal.md): attaches
+# the voice sink to the gateway so the staging guild exercises room lifecycle
+# events. It reads the voice tables (migrations 0224-0229, 0412-0414, 0416-0418), so
+# the staging ledger must already carry them (post-apply plan shows no pending). Reconcile only touches rows the
+# bot tracks; the guild's permanent voice channels stay untouched. Forwarded
+# into the container via FORWARDED_FLAGS (wrangler/src/container-env.ts).
+# Never top-level and never production: scripts/check-env-bindings.py fails
+# either. Rollback: delete the line, redeploy.
+TWO_VOICE = "1"
+
+[env.production.version_metadata]
+binding = "CF_VERSION_METADATA"
+
+# Operator 2026-10-01 (TOG-11131): staging container logs, so the startup
+# exit-1 since #119 can be diagnosed from Workers Logs.
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
+
+[[env.production.containers]]
+class_name = "TwoBotContainer"
+image = "../Dockerfile"
+# ADR 0001: target `lite`; escalate to `basic` only if measured RSS > ~200 MiB.
+instance_type = "lite"
+max_instances = 1
+
+[env.production.containers.constraints]
+regions = ["ENAM"]
+jurisdiction = "us"
+
+[[env.production.durable_objects.bindings]]
+name = "TWO_BOT"
+class_name = "TwoBotContainer"
+
+[env.production.exports.TwoBotContainer]
+type = "durable-object"
+storage = "sqlite"
+
+[env.production.vars]
+# B3 (TOG-9696) redirect snapshot placeholder (see staging block above).
+REDIRECT_FALLBACK_CODE = ""
+REDIRECT_MAPPINGS_JSON = "[]"
+# Worker-only paging switch: installing a webhook secret alone never sends.
+# Vars are non-inheritable, so every environment explicitly defaults to off.
+OPS_ALERT_FORWARDING = "off"
+BOT_PORT = "8080"
+KEEPALIVE_SECONDS = "60"
+TWO_GUILD_NAME = "TogetherWeOwn"
+
+# TOG-12193: production Workers Logs, the B4 cutover log source for the alert
+# rules, runbook and threat-model F4/F6 (staging has had them since TOG-11131).
+# Head sampling is decided once per invocation, so a rate below 1 would drop
+# that share of console.error, invite_redirect_invalid_config and 401/503
+# rejection invocations too: logs stay unsampled. No top-level [observability]:
+# nothing deploys the env-less Worker, and an inherited block must not stand in
+# for a named env's own (wrangler/test/observability-config.test.ts).
+[env.production.observability]
+enabled = true
+head_sampling_rate = 1
+
+# Traces stay off: outbound fetch spans record `url.full`, which would copy the
+# OPS_ALERT_WEBHOOK_URL token into trace storage. Explicit, so a later
+# compatibility_date that lets `enabled` start tracing cannot do it silently.
+[env.production.observability.traces]
+enabled = false

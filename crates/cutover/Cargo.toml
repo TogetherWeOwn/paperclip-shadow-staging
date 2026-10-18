@@ -1,0 +1,111 @@
+[package]
+name = "two-bot-cutover"
+version = "0.4.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# Cutover data path (TOG-9882): one-shot MEE6 XP / reward / history
+# import-backfill operator tools. Library modules port the pure legacy logic
+# (parse, plan, reconcile); `src/db.rs` + `src/rest.rs` hold the sqlx and
+# twilight seams; `src/bin/` holds the operator CLIs.
+#
+# Intra-workspace path deps carry an explicit version (still resolved via
+# path): cargo-deny `wildcards = "deny"` rejects version-less deps.
+
+[dependencies]
+# `db` for shared durable admission and the redacting database URL helper.
+# sqlx is already a direct dependency, so no new driver burden.
+two-bot-core = { version = "0.4.0", path = "../core", features = ["db"] }
+two-bot-discord = { version = "0.4.0", path = "../discord" }
+hex = { workspace = true }
+serde = { workspace = true }
+# Preserve JSON syntax kinds and exact numeric tokens during parity checks.
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+twilight-http = { workspace = true }
+twilight-model = { workspace = true }
+url = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[dev-dependencies]
+rustls = { workspace = true }
+two-bot-testsupport = { version = "0.4.0", path = "../testsupport" }
+
+[[bin]]
+name = "legacy_verify"
+path = "src/bin/legacy_verify.rs"
+
+[[bin]]
+name = "levels-import-mee6"
+path = "src/bin/levels_import_mee6.rs"
+
+[[bin]]
+name = "levels-role-rewards"
+path = "src/bin/levels_role_rewards.rs"
+
+[[bin]]
+name = "levels-import-rewards-probe"
+path = "src/bin/levels_import_rewards_probe.rs"
+
+[[bin]]
+name = "backfill"
+path = "src/bin/backfill.rs"
+
+[[bin]]
+name = "backfill-messages"
+path = "src/bin/backfill_messages.rs"
+
+[[bin]]
+name = "capture"
+path = "src/bin/capture.rs"
+
+[[bin]]
+name = "dedupe-events"
+path = "src/bin/dedupe_events.rs"
+
+[[bin]]
+name = "legacy_copy"
+path = "src/bin/legacy_copy.rs"
+
+[[bin]]
+name = "staging-migrate"
+path = "src/bin/staging_migrate.rs"
+
+[[bin]]
+name = "raid-list"
+path = "src/bin/raid_list.rs"
+
+[[bin]]
+name = "raid-remove"
+path = "src/bin/raid_remove.rs"
+
+[[bin]]
+name = "gateway-force-identify"
+path = "src/bin/gateway_force_identify.rs"
+
+[[bin]]
+name = "reengagement-list"
+path = "src/bin/reengagement_list.rs"
+
+[[bin]]
+name = "rollback-delta"
+path = "src/bin/rollback_delta.rs"
+
+[[bin]]
+name = "report"
+path = "src/bin/report.rs"
+
+[[bin]]
+name = "ghost-cleanup"
+path = "src/bin/ghost_cleanup.rs"
